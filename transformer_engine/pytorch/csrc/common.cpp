@@ -26,6 +26,7 @@ std::vector<size_t> convert_shape_back_from_fp4(const std::vector<size_t>& shape
   return ret;
 }
 
+
 std::vector<size_t> getTensorShape(const at::Tensor& t) {
   std::vector<size_t> shape;
   for (auto s : t.sizes()) {
@@ -73,22 +74,42 @@ transformer_engine::DType getTransformerEngineFP8Type(bool e4m3_if_hybrid,
 }
 
 TensorWrapper makeTransformerEngineTensor(py::handle tensor, py::handle quantizer) {
-  NVTE_CHECK(!tensor.is_none(), "Tensor is not allocated!");
+  // std::string type_name = py::str(tensor.get_type().attr("__name__")).cast<std::string>();
+  // if (type_name.find("MXFP4") != std::string::npos) {
+  //     fprintf(stderr, "\n[DEBUG] makeTransformerEngineTensor checking: %s\n", type_name.c_str());
+  // }
+  // // --- DEBUG END ---
+
   std::unique_ptr<Quantizer> my_quantizer = convert_quantizer(quantizer);
-  // check for both quantizer & tensor type:
-  // mxfp8 tensor -> mxfp8 quantizer
-  // float8 tensor -> delayed scaling quantizer OR current scaling quantizer
-  // also during dequantize, the quantizer param is unknown -> so quantizer is NoneQuantizer
+  
+  int converter_idx = 0;
   for (auto [check_type, check_quantizer_type, create_tensor, _] :
        detail::custom_types_converters) {
-    if (check_type(tensor.ptr())) {
+    
+    // --- DEBUG START ---
+    bool type_match = check_type(tensor.ptr());
+    // if (type_name.find("MXFP4") != std::string::npos) {
+    //     fprintf(stderr, "  [DEBUG] Converter #%d check: %s\n", converter_idx, type_match ? "MATCH" : "FAIL");
+    // }
+    // --- DEBUG END ---
+
+    if (type_match) {
       if (!(quantizer.is_none() || check_quantizer_type(quantizer.ptr()))) {
         continue;
       }
       auto x = create_tensor(tensor, my_quantizer.get());
       return x;
     }
+    converter_idx++;
   }
+
+  // --- DEBUG START ---
+  // if (type_name.find("MXFP4") != std::string::npos) {
+  //     fprintf(stderr, "[DEBUG] !!! FALLBACK TRIGGERED for %s !!!\n", type_name.c_str());
+  //     fprintf(stderr, "[DEBUG] This strips scales and causes the crash.\n\n");
+  // }
+  // --- DEBUG END ---
+
   NVTE_CHECK(dynamic_cast<NoneQuantizer*>(my_quantizer.get()) != nullptr,
              "Unexpected quantization params type.");
 

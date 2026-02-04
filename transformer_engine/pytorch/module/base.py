@@ -1194,7 +1194,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # Debug without all-gather: unfused cast and bgrad
         # bgrad only if wgrad is in FP8, otherwise it is fused with wgrad and we return None
-        if ctx.debug:
+        if ctx.debug or getattr(quantizer, "is_reference_quantizer", False):
             grad_output_ = quantizer(grad_output)
             if (
                 isinstance(

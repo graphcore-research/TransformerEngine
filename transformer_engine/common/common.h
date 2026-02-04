@@ -50,12 +50,17 @@ inline bool is_delayed_tensor_scaling(const NVTEScalingMode &mode) {
 
 inline bool is_nvfp4_scaling(const NVTEScalingMode &mode) { return mode == NVTE_NVFP4_1D_SCALING; }
 
+inline bool is_mxfp4_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP4_1D_SCALING; }
+
 inline bool is_mxfp8_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP8_1D_SCALING; }
 
 inline bool is_mxfp_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP8_1D_SCALING; }
 
 inline bool is_nvfp_scaling(const NVTEScalingMode &mode) { return mode == NVTE_NVFP4_1D_SCALING; }
 
+inline bool is_fp4_block_scaling(NVTEScalingMode mode) {
+  return is_nvfp_scaling(mode) || is_mxfp4_scaling(mode);
+}
 inline size_t product(const std::vector<size_t> &shape, const size_t begin, const size_t end) {
   NVTE_CHECK(begin <= end && end <= shape.size(), "Attempted to access entries ", begin, " to ",
              end, " in a vector with ", shape.size(), " entries");
@@ -185,6 +190,7 @@ struct Tensor {
     switch (scaling_mode) {
       case NVTE_NVFP4_1D_SCALING:
       case NVTE_DELAYED_TENSOR_SCALING:
+      case NVTE_MXFP4_1D_SCALING: // <--- ADD THIS LINE
         if (!has_data() && has_columnwise_data()) {
           std::vector<size_t> ret;
           if (!columnwise_data.shape.empty()) {
@@ -273,6 +279,8 @@ struct QuantizationConfig {
   NVTETensor rng_state = nullptr;
   bool nvfp4_2d_quantization = false;
   bool stochastic_rounding = false;
+  bool global_scaling = false;
+  bool encode_centric = false;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(bool),                          // force_pow_2_scales
@@ -281,7 +289,9 @@ struct QuantizationConfig {
       sizeof(Float8BlockScaleTensorFormat),  // float8_block_scale_tensor_format
       sizeof(NVTETensor),                    // rng_seed and offset
       sizeof(bool),                          // nvfp4_2d_quantization
-      sizeof(bool)                           // stochastic_rounding
+      sizeof(bool),     // stochastic_rounding
+      sizeof(bool),                           // global_scaling
+      sizeof(bool)                           // encode_centric
   };
 };
 

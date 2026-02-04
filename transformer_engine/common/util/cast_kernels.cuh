@@ -24,6 +24,7 @@
 #include "../utils.cuh"
 #include "math.h"
 #include "nvfp4_transpose.cuh"
+#include "mxfp4_transpose.cuh" // [FIX] Added Include
 #include "ptx.cuh"
 #include "transformer_engine/transformer_engine.h"
 
@@ -2064,8 +2065,9 @@ void quantize_helper(const NVTETensor input, const NVTETensor grad, NVTETensor o
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                   output_tensor->scaling_mode == NVTE_MXFP4_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4/MXFP4 quantization.");
   }
 
   // Dispatch to quantization kernel depending on data format
@@ -2094,6 +2096,52 @@ void quantize_helper(const NVTETensor input, const NVTETensor grad, NVTETensor o
           workspace_tensor, stream);
       break;
     }
+    // [MXFP4 Integration Start]
+    case NVTE_MXFP4_1D_SCALING: {
+      CheckNoopTensor(*noop_tensor, "cast_noop");
+      CheckInputTensor(*input_tensor, "input");
+      CheckOutputTensor(*output_tensor, "output", false);
+
+      int32_t rows = input_tensor->flat_first_dim();
+      int32_t cols = input_tensor->flat_last_dim();
+      auto dtype = input_tensor->dtype();
+      
+      // Check if we can use the Blackwell Native Kernel (SM100 + Aligned + BF16)
+      bool use_optimized_kernel = (dtype == DType::kBFloat16) && 
+                                  (rows % 32 == 0) && (cols % 32 == 0) &&
+                                  is_supported_by_CC_100();
+      // printf("MXFP4 config: rows=%d cols=%d dtype=%d cc100=%d use_optimized_kernel=%d\n",
+      //  rows, cols, int(dtype), int(is_supported_by_CC_100()), int(use_optimized_kernel));
+
+      if (use_optimized_kernel) {
+        // [1] Call the new Host Wrapper you just added to mxfp4_transpose.cuh
+        if (quant_config_cpp.nvfp4_2d_quantization) {
+             mxfp4_quantize_transpose<IS_ACT, ParamOP, OP, true>(
+                 *input_tensor, noop_tensor, output_tensor, &quant_config_cpp, stream);
+        } else {
+             mxfp4_quantize_transpose<IS_ACT, ParamOP, OP, false>(
+                 *input_tensor, noop_tensor, output_tensor, &quant_config_cpp , stream);
+        }
+      } else {
+        // [2] Fallback to the Generic/Looping kernel
+        auto &global_amax = (output_tensor->amax.dptr != nullptr) ? output_tensor->amax
+                                                                  : output_tensor->columnwise_amax;
+        quantize_transpose_vector_blockwise_mxfp4(
+            /*input=*/input_tensor->data, /*global_amax=*/global_amax,
+            /*scale_inv=*/output_tensor->scale_inv,
+            /*scale_inv_t=*/output_tensor->columnwise_scale_inv,
+            /*output=*/output_tensor->data, /*output_t=*/output_tensor->columnwise_data,
+            /*epsilon=*/0.0f, /*return_identity=*/output_tensor->has_data(),
+            /*return_transpose=*/output_tensor->has_columnwise_data(), /*pow2_scale=*/false,
+            /*swizzled_scale=*/false,
+            /*use_stochastic_rounding=*/quant_config_cpp.stochastic_rounding,
+            /*rng_state=*/quant_config_cpp.rng_state,
+            /*use_2d_quantization=*/quant_config_cpp.nvfp4_2d_quantization,
+            /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
+      }
+      break;
+    }
+    // [MXFP4 Integration End]
     case NVTE_NVFP4_1D_SCALING: {
       // Check tensors
       CheckNoopTensor(*noop_tensor, "cast_noop");

@@ -5,7 +5,7 @@
  ************************************************************************/
 
 /*! \file dequantize_kernels.cuh
- *  \brief CUDA kernels to cast from MXFP8.
+ * \brief CUDA kernels to cast from MXFP8.
  */
 
 #ifndef TRANSFORMER_ENGINE_DEQUANTIZE_KERNELS_CUH_
@@ -373,6 +373,57 @@ __global__ void __launch_bounds__(512)
     output_vec[my_output_index + i] = out;
   }
 }
+
+template <typename OType>
+__global__ void __launch_bounds__(512)
+    dequantize_mxfp4_kernel(const void *const input, OType *output, const uint8_t *const scales,
+                            const float *const tensor_amax, // <--- New Argument
+                            const size_t N, const size_t M, const size_t scale_stride) {
+  const size_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t x = thread_idx % M;
+  const size_t y = thread_idx / M;
+
+  if (y >= N) return;
+
+  union fp4vec {
+    uint64_t vec;
+    fp4e2m1x4 small_vec[4];
+  };
+  using OVec = Vec<OType, 4>;
+  const uint64_t *const input_vectorized = reinterpret_cast<const uint64_t *>(input);
+  OVec *output_vec = reinterpret_cast<OVec *>(output);
+
+  const size_t my_index = x + y * M;
+  // MXFP4 scaling: 1 scale per 32 elements.
+  // Each thread processes 16 elements (x). Therefore scale index is x / 2.
+  const size_t my_scale_index = (x / 2) + y * scale_stride;
+  const size_t my_output_index = (x + y * M) * 4;
+
+  fp4vec value;
+  value.vec = input_vectorized[my_index];
+  const uint8_t biased_exponent = scales[my_scale_index];
+  
+  // E8M0 scale: 2^(biased_exponent - 127)
+  float final_scale = exp2f(static_cast<float>(biased_exponent) - 127.0f);
+
+  // [FIX] Apply Global Scale Restoration: S_dec = AMAX / 6.0
+  // If tensor_amax is provided, we must un-scale the global compression.
+  if (tensor_amax != nullptr) {
+      constexpr float fp4_max_inv = 1.0f / 6.0f;
+      final_scale *= (*tensor_amax * fp4_max_inv);
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float4 current = static_cast<float4>(value.small_vec[i]);
+    OVec out;
+    out.data.elt[0] = static_cast<OType>(current.x * final_scale);
+    out.data.elt[1] = static_cast<OType>(current.y * final_scale);
+    out.data.elt[2] = static_cast<OType>(current.z * final_scale);
+    out.data.elt[3] = static_cast<OType>(current.w * final_scale);
+    output_vec[my_output_index + i] = out;
+  }
+}
 #endif  // CUDA_VERSION
 
 void fp4_dequantize(const Tensor &input, Tensor *output, cudaStream_t stream) {
@@ -409,6 +460,67 @@ void fp4_dequantize(const Tensor &input, Tensor *output, cudaStream_t stream) {
 #endif  // CUDA_VERSION >= 12080
 }
 
+void mxfp4_dequantize(const Tensor &input, Tensor *output, cudaStream_t stream) {
+#if CUDA_VERSION >= 12080
+  CheckInputTensor(input, "input");
+  CheckOutputTensor(*output, "output");
+  NVTE_CHECK(input.data.dtype == DType::kFloat4E2M1, "Input must have FP4 type.");
+  NVTE_CHECK(is_high_precision_dtype(output->data.dtype), "Output must be in higher precision.");
+  NVTE_CHECK(output->data.shape == input.data.shape, "Input and output shapes need to match.");
+
+  if (input.data.dtype == DType::kFloat8E4M3) {
+    bool valid_scale_type =
+        (input.scale_inv.dtype == DType::kByte) ||
+        (input.scale_inv.dtype == DType::kFloat8E8M0);
+    NVTE_CHECK(valid_scale_type,
+               "MXFP4 simulation requires Byte/E8M0 scale type.");
+
+    // Re-use the existing MXFP8 dequant kernel. It already implements
+    //   p_vals = FP8(E4M3) -> float
+    //   block_scale = E8M0  -> float
+    //   x_hat = p_vals * block_scale
+    //
+    // This matches your Python test:
+    //   p_vals      = fp8_e4m3_to_float(qx_bytes)
+    //   x_hat_sut   = p_vals * e8m0_to_scale(sx)
+    mxfp8_dequantize(input, output, stream);
+    return;
+  }
+  bool valid_scale_type =
+      (input.scale_inv.dtype == DType::kByte) || (input.scale_inv.dtype == DType::kFloat8E8M0);
+  NVTE_CHECK(valid_scale_type, "MXFP4 requires Byte/E8M0 scale type.");
+
+  constexpr int MXFP4_BLOCK_SIZE = 32;
+  constexpr int FP4_READ_SIZE = 16;
+  const size_t N = input.flat_first_dim();
+  const size_t M = input.flat_last_dim();
+  const float* amax_ptr = (input.amax.dptr != nullptr) 
+                          ? reinterpret_cast<const float*>(input.amax.dptr) 
+                          : nullptr;
+  NVTE_CHECK(M % MXFP4_BLOCK_SIZE == 0, "Last dimension of MXFP4 tensors needs to be divisible by ",
+             MXFP4_BLOCK_SIZE, ", but got ", input.data.shape, ".");
+
+  const size_t Mread = M / FP4_READ_SIZE;
+  const size_t total = N * Mread;
+  const size_t threads = 512;
+  const size_t blocks = DIVUP(total, threads);
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+      output->data.dtype, OType,
+
+      dequantize_mxfp4_kernel<<<blocks, threads, 0, stream>>>(
+          input.data.dptr, 
+          reinterpret_cast<OType *>(output->data.dptr),
+          reinterpret_cast<uint8_t *>(input.scale_inv.dptr), 
+          amax_ptr, // <--- Pass AMAX
+          N, Mread,
+          input.scale_inv.shape.back());); // NOLINT(*)
+  NVTE_CHECK_CUDA(cudaGetLastError());
+#else
+  NVTE_ERROR("CUDA 12.8 or higher is needed for FP4 calculation!");
+#endif  // CUDA_VERSION >= 12080
+}
+
 }  // namespace dequantization
 
 namespace detail {
@@ -432,6 +544,10 @@ void dequantize_helper(const Tensor &input, Tensor *output, cudaStream_t stream)
     }
     case NVTE_NVFP4_1D_SCALING: {
       dequantization::fp4_dequantize(input, output, stream);
+      break;
+    }
+    case NVTE_MXFP4_1D_SCALING: {
+      dequantization::mxfp4_dequantize(input, output, stream);
       break;
     }
     default:

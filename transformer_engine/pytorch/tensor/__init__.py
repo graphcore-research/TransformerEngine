@@ -21,6 +21,7 @@ from .float8_tensor import Float8Tensor, Float8Quantizer, Float8CurrentScalingQu
 from .mxfp8_tensor import MXFP8Tensor, MXFP8Quantizer
 from .float8_blockwise_tensor import Float8BlockwiseQTensor, Float8BlockQuantizer
 from .nvfp4_tensor import NVFP4Tensor, NVFP4Quantizer
+from .mxfp4_tensor import MXFP4Tensor, MXFP4Quantizer
 from .utils import cast_master_weights_to_fp8, replace_raw_data
 
 __all__ = [
@@ -42,6 +43,8 @@ __all__ = [
     "NVFP4Tensor",
     "prepare_for_saving",
     "restore_from_saved",
+    "MXFP4Tensor",
+    "MXFP4Quantizer"
 ]
 
 
@@ -89,5 +92,7 @@ def get_all_tensor_types():
         Float8BlockwiseQTensorStorage,
         NVFP4Tensor,
         NVFP4TensorStorage,
+        MXFP4Tensor,
+        MXFP4Quantizer
     ]
     return all_tensor_types

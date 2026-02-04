@@ -51,15 +51,30 @@ using namespace cute;
 using cute::Tensor;  // Ensure unqualified Tensor refers to cute::Tensor, not transformer_engine::Tensor
 
 // calculate the global encode scale factor for a given global amax.
-__device__ __forceinline__ float ComputeGlobalEncodeScaleFP4(const float global_amax) {
+__device__ __forceinline__ float ComputeGlobalEncodeScaleFP4_NVFP4(const float global_amax) {
   constexpr float kFP8E4M3Max = 448.0f;
   constexpr float kFP4E2M1Max = 6.0f;
-  // If scale is infinity, return max value of float32
+
   float global_encode_scale = cutlass::minimum_with_nan_propagation<float>{}(
-    kFP8E4M3Max * kFP4E2M1Max / global_amax, cutlass::platform::numeric_limits<float>::max());
-  // If global amax is 0 or infinity, return 1
+      kFP8E4M3Max * kFP4E2M1Max / global_amax,
+      cutlass::platform::numeric_limits<float>::max());
+
+  // If global amax is 0 or we get a degenerate scale, fall back to 1
   return (global_amax == 0.f || global_encode_scale == 0.f) ? 1.f : global_encode_scale;
 }
+
+__device__ __forceinline__ float ComputeGlobalEncodeScaleFP4_MXFP4(const float global_amax) {
+  // MXFP4: only FP4 dynamic range (no 448 term)
+  constexpr float kFP4E2M1Max = 6.0f;
+
+  float global_encode_scale = cutlass::minimum_with_nan_propagation<float>{}(
+      kFP4E2M1Max / global_amax,
+      cutlass::platform::numeric_limits<float>::max());
+
+  // If global amax is 0 or we get a degenerate scale, fall back to 1
+  return (global_amax == 0.f || global_encode_scale == 0.f) ? 1.f : global_encode_scale;
+}
+
 
 template <class ElementA,
           class ElementB,
@@ -138,7 +153,8 @@ template <class MShape, class NShape, class KShape, class ClusterTileShape,
           class TC, class CStride, class CSmemLayout,
           class TSFC,
           class TiledMMA,
-          bool kEnableStochasticRounding = false>
+          bool kEnableStochasticRounding = false,
+          bool kIsMXFP4 = false>
 __global__ static
 void
 rht_gemm_device(MShape M, NShape N, KShape K, ClusterTileShape cluster_tile,
@@ -433,7 +449,9 @@ rht_gemm_device(MShape M, NShape N, KShape K, ClusterTileShape cluster_tile,
     // NVFP4 non-E8 recipe constants and global scales
     static constexpr float fp4_max = 6.0f;
 
-    const float global_encode_scale = ComputeGlobalEncodeScaleFP4(global_amax_val);
+    const float global_encode_scale = kIsMXFP4
+      ? ComputeGlobalEncodeScaleFP4_MXFP4(global_amax_val)
+      : ComputeGlobalEncodeScaleFP4_NVFP4(global_amax_val);
     const float global_decode_scale = 1.0f / global_encode_scale;
     auto sfd_converter = cutlass::NumericConverter<TSFC, float>{};
 
@@ -540,7 +558,7 @@ rht_gemm_device(MShape M, NShape N, KShape K, ClusterTileShape cluster_tile,
 // B: 16 x 16: row-major
 // C: m x n: row-major
 // SFC: m x (n/16): row-major
-template <typename TA, typename TB, typename TC, typename TSFC, bool kEnableStochasticRounding = false>
+template <typename TA, typename TB, typename TC, typename TSFC, bool kEnableStochasticRounding = false, bool kIsMXFP4 = false>
 void
 rht_gemm_ntt_w_sfc(int m, int n,
         TA const* A,
@@ -652,7 +670,8 @@ rht_gemm_ntt_w_sfc(int m, int n,
                                   TC, decltype(dC), decltype(sC),
                                   TSFC,
                                   decltype(mma),
-                                  kEnableStochasticRounding>;
+                                  kEnableStochasticRounding,
+                                  kIsMXFP4>;
 
   bool status = cudaFuncSetAttribute(*kernel_ptr,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -675,7 +694,7 @@ rht_gemm_ntt_w_sfc(int m, int n,
 
 // this function is used to wrap the rht_gemm_ntt_w_sfc function
 //to transpose the input tensor A
-template <typename TA, typename TB, typename TC, typename TSFC, bool kEnableStochasticRounding = false>
+template <typename TA, typename TB, typename TC, typename TSFC, bool kEnableStochasticRounding = false, bool kIsMXFP4 = false>
 void
 rht_gemm_ttt_wrapper(int m, int n,
         TA const* A,
@@ -698,7 +717,7 @@ rht_gemm_ttt_wrapper(int m, int n,
   // B: 16 x 16: row-major
   // C: n x m: row-major
   // SFC: n x (m/16): row-major
-  rht_gemm_ntt_w_sfc<TA, TB, TC, TSFC, kEnableStochasticRounding>(
+  rht_gemm_ntt_w_sfc<TA, TB, TC, TSFC, kEnableStochasticRounding,kIsMXFP4>(
     n, m,
     A, B, C,
     SFC, global_amax,
@@ -758,6 +777,13 @@ void hadamard_transform_cast_fusion_columnwise(const Tensor &input_, Tensor &out
   NVTE_CHECK(hadamard_matrix_.dtype() == transformer_engine::DType::kBFloat16,
              "Hadamard matrix must be BF16 tensor, but dtype is ",
              to_string(hadamard_matrix_.dtype()), ".");
+  const bool is_mxfp4_recipe =
+      (output_.scaling_mode == NVTE_MXFP4_1D_SCALING);
+
+  NVTE_CHECK(
+      is_nvfp4_scaling(output_.scaling_mode) || is_mxfp4_recipe,
+      "hadamard_transform_cast_fusion_columnwise only supports NVFP4 or MXFP4 scaling for output, "
+      "but got scaling_mode = " + to_string(output_.scaling_mode));
   const SimpleTensor &hadamard_matrix = hadamard_matrix_.data;
   NVTE_CHECK(
       (hadamard_matrix_.shape() == std::vector<size_t>{kHadamardDimension, kHadamardDimension}),
@@ -778,6 +804,8 @@ void hadamard_transform_cast_fusion_columnwise(const Tensor &input_, Tensor &out
   NVTE_CHECK(n % hadamard_dimension == 0, "row_length must be divisible by hadamard_dimension.");
 
   NVTE_CHECK(m % hadamard_dimension == 0, "num_rows must be divisible by hadamard_dimension");
+
+  
 
   int k_tile_size = 1024;
 
@@ -810,18 +838,22 @@ void hadamard_transform_cast_fusion_columnwise(const Tensor &input_, Tensor &out
   }
   TRANSFORMER_ENGINE_SWITCH_CONDITION(
       use_stochastic_rounding, kUseStochasticRounding,
-      detail::rht_gemm_ttt_wrapper<TA, TB, TC, TSFC, kUseStochasticRounding>(
-          /*m=*/m,
-          /*n=*/n,
-          /*A=*/reinterpret_cast<TA const *>(input.dptr),
-          /*B=*/reinterpret_cast<TB const *>(hadamard_matrix.dptr),
-          /*C=*/reinterpret_cast<TC *>(output_t.dptr),
-          /*SFC=*/reinterpret_cast<TSFC *>(scale_inv_t.dptr),
-          /*global_amax=*/reinterpret_cast<float const *>(global_amax.dptr),
-          /*rng_state=*/rng_state,
-          /*sm_count=*/sm_count,
-          /*stream=*/stream,
-          /*k_tile_size=*/k_tile_size););
+      TRANSFORMER_ENGINE_SWITCH_CONDITION(
+          is_mxfp4_recipe, kIsMXFP4,
+          detail::rht_gemm_ttt_wrapper<TA, TB, TC, TSFC,
+                                       kUseStochasticRounding,
+                                       kIsMXFP4>(
+              /*m=*/m,
+              /*n=*/n,
+              /*A=*/reinterpret_cast<TA const *>(input.dptr),
+              /*B=*/reinterpret_cast<TB const *>(hadamard_matrix.dptr),
+              /*C=*/reinterpret_cast<TC *>(output_t.dptr),
+              /*SFC=*/reinterpret_cast<TSFC *>(scale_inv_t.dptr),
+              /*global_amax=*/reinterpret_cast<float const *>(global_amax.dptr),
+              /*rng_state=*/rng_state,
+              /*sm_count=*/sm_count,
+              /*stream=*/stream,
+              /*k_tile_size=*/k_tile_size);););
 }
 
 }  // namespace transformer_engine

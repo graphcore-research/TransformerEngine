@@ -13,10 +13,25 @@ std::optional<at::Tensor> swizzle_scaling_factors(transformer_engine::TensorWrap
                                                   bool rowwise) {
   using namespace transformer_engine::pytorch;
 
+  // --- DEBUG START ---
+  // fprintf(stderr, "\n[DEBUG] swizzle_scaling_factors called.\n");
+  // fprintf(stderr, "  > Requested rowwise: %s\n", rowwise ? "TRUE" : "FALSE");
+  
+  // if (input.scaling_mode() == NVTE_MXFP4_1D_SCALING) {
+  //     fprintf(stderr, "  > Scaling Mode: NVTE_MXFP4_1D_SCALING\n");
+  // } else if (input.scaling_mode() == NVTE_NVFP4_1D_SCALING) {
+  //     fprintf(stderr, "  > Scaling Mode: NVTE_NVFP4_1D_SCALING\n");
+  // } else {
+  //     fprintf(stderr, "  > Scaling Mode: %d\n", (int)input.scaling_mode());
+  // }
+  // --- DEBUG END ---
+
   if (input.scaling_mode() == NVTE_INVALID_SCALING) {
     NVTE_ERROR("Invalid scaling mode for swizzle.");
   } else if (input.scaling_mode() != NVTE_MXFP8_1D_SCALING &&
-             input.scaling_mode() != NVTE_NVFP4_1D_SCALING) {
+             input.scaling_mode() != NVTE_NVFP4_1D_SCALING &&
+             input.scaling_mode() != NVTE_MXFP4_1D_SCALING) {
+    // fprintf(stderr, "  > Scaling mode not supported for swizzle. Returning nullopt.\n"); // DEBUG
     return std::nullopt;
   }
 
@@ -27,6 +42,17 @@ std::optional<at::Tensor> swizzle_scaling_factors(transformer_engine::TensorWrap
 
   NVTEBasicTensor scale_inv;
   NVTEShape nvte_input_shape;
+  
+  // --- DEBUG START: Inspect what we are about to grab ---
+  if (rowwise) {
+      auto d = input.get_rowwise_data();
+      auto s = input.get_rowwise_scale_inv();
+  } else {
+      auto d = input.get_columnwise_data();
+      auto s = input.get_columnwise_scale_inv();
+  }
+  // --- DEBUG END ---
+
   if (rowwise) {
     nvte_input_shape = input.shape();
     scale_inv = input.get_rowwise_scale_inv();
@@ -37,6 +63,12 @@ std::optional<at::Tensor> swizzle_scaling_factors(transformer_engine::TensorWrap
 
   auto input_shape = nvte_shape_to_vector(nvte_input_shape);
   auto scale_inv_shape = nvte_shape_to_vector(scale_inv.shape);
+
+  // // --- DEBUG START ---
+  // fprintf(stderr, "  > Input Shape Vector Size: %lu\n", input_shape.size());
+  // if (input_shape.size() > 0) fprintf(stderr, "  > Input Shape: [%lu, ...]\n", input_shape[0]);
+  // fprintf(stderr, "  > Scale Shape Vector Size: %lu\n", scale_inv_shape.size());
+  // // --- DEBUG END ---
 
   NVTE_CHECK(input_shape.size() >= 2, "Wrong ndims for swizzle input shape.");
 
@@ -73,7 +105,9 @@ std::optional<at::Tensor> swizzle_scaling_factors(transformer_engine::TensorWrap
   }
 
   // Launch kernel
+  // fprintf(stderr, "  > Launching nvte_swizzle_scaling_factors...\n"); // DEBUG
   nvte_swizzle_scaling_factors(input_cu.data(), output_cu.data(), at::cuda::getCurrentCUDAStream());
+  // fprintf(stderr, "  > Kernel launch success.\n"); // DEBUG
 
   if (rowwise) {
     input.set_rowwise_scale_inv(swizzled_scale_inv_dptr, scale_inv_dtype, scale_inv_shape);
@@ -83,7 +117,6 @@ std::optional<at::Tensor> swizzle_scaling_factors(transformer_engine::TensorWrap
 
   return swizzled_scale_inv;
 }
-
 std::optional<at::Tensor> multi_tensor_swizzle_scaling_factors(
     std::vector<transformer_engine::TensorWrapper>& tensors, bool rowwise) {
   using namespace transformer_engine::pytorch;

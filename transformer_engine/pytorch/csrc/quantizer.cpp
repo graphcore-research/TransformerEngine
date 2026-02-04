@@ -10,6 +10,11 @@
 #include "pybind.h"
 #include "torch/torch.h"
 
+// [MXFP4 FIX] Define the simulation flag
+#ifndef MXFP4_SIMULATE_WITH_FP8
+#define MXFP4_SIMULATE_WITH_FP8 1
+#endif
+
 namespace transformer_engine::pytorch {
 
 namespace {
@@ -1139,7 +1144,7 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   this->with_post_rht_amax = quantizer.attr("with_post_rht_amax").cast<bool>();
   this->with_2d_quantization = quantizer.attr("with_2d_quantization").cast<bool>();
   this->stochastic_rounding = quantizer.attr("stochastic_rounding").cast<bool>();
-
+  this->encode_centric = quantizer.attr("encode_centric").cast<bool>();
   // Get amax reduction group if needed for NVFP4 AG
   const bool with_amax_reduction = quantizer.attr("with_amax_reduction").cast<bool>();
   c10::intrusive_ptr<dist_group_type> amax_reduction_group;
@@ -1451,6 +1456,7 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
   }
   quant_config.set_nvfp4_2d_quantization(this->with_2d_quantization);
   quant_config.set_stochastic_rounding(this->stochastic_rounding);
+  quant_config.set_encode_centric(this->encode_centric);
 
   // We only need RHT for columnwise usage.
   // flat first dim and last dim for multi dimensional input
@@ -1700,6 +1706,630 @@ std::vector<size_t> NVFP4Quantizer::get_scale_shape(const std::vector<size_t>& s
     scale_shape = {sinv0, sinv1};
   }
   return scale_shape;
+}
+constexpr size_t MXFP4_BLOCK_SIZE = 32;
+
+MXFP4Quantizer::MXFP4Quantizer(const py::handle& quantizer) : Quantizer(quantizer) {
+  this->dtype = quantizer.attr("dtype").cast<DType>();
+  this->with_rht = quantizer.attr("with_rht").cast<bool>();
+  this->with_post_rht_amax = quantizer.attr("with_post_rht_amax").cast<bool>();
+  this->with_2d_quantization = quantizer.attr("with_2d_quantization").cast<bool>();
+  this->stochastic_rounding = quantizer.attr("stochastic_rounding").cast<bool>();
+  this->global_scaling = quantizer.attr("global_scaling").cast<bool>();
+  this->encode_centric = quantizer.attr("encode_centric").cast<bool>();
+
+  // Get amax reduction group if needed
+  const bool with_amax_reduction = quantizer.attr("with_amax_reduction").cast<bool>();
+  c10::intrusive_ptr<dist_group_type> amax_reduction_group;
+  if (with_amax_reduction) {
+    auto group = quantizer.attr("_canonicalized_amax_reduction_group")();
+    NVTE_CHECK(!group.is_none(), "MXFP4Quantizer could not canonicalize amax reduction group");
+    amax_reduction_group = group.cast<c10::intrusive_ptr<dist_group_type>>();
+  }
+  this->with_amax_reduction = with_amax_reduction;
+  this->amax_reduction_group = amax_reduction_group;
+
+  this->rht_matrix_random_sign_mask_t = quantizer.attr("rht_matrix_random_sign_mask_t").cast<int>();
+  this->rht_matrix = quantizer.attr("rht_matrix").cast<at::Tensor>();
+}
+
+void MXFP4Quantizer::set_quantization_params(TensorWrapper* tensor) const {
+  // set dtype for rowwise and columnwise data in tensor wrapper
+  auto rowwise_data = tensor->get_rowwise_data();
+  rowwise_data.dtype = static_cast<NVTEDType>(this->dtype);
+
+  auto columnwise_data = tensor->get_columnwise_data();
+  columnwise_data.dtype = static_cast<NVTEDType>(this->dtype);
+
+  tensor->set_rowwise_data(rowwise_data.data_ptr, static_cast<DType>(rowwise_data.dtype),
+                           rowwise_data.shape);
+  tensor->set_columnwise_data(columnwise_data.data_ptr, static_cast<DType>(columnwise_data.dtype),
+                              columnwise_data.shape);
+}
+
+std::pair<TensorWrapper, py::object> MXFP4Quantizer::create_tensor(const std::vector<size_t>& shape,
+                                                                   DType dtype) const {
+  using namespace pybind11::literals;
+
+  // Tensor dimensions
+  const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
+  size_t flat_first_dim = 1;
+  if (shape.size() > 0) {
+    for (size_t i = 0; i < shape.size() - 1; ++i) {
+      flat_first_dim *= shape[i];
+    }
+  }
+  const size_t flat_last_dim = shape.size() > 0 ? shape.back() : 1;
+  NVTE_CHECK(flat_first_dim % MXFP4_BLOCK_SIZE == 0, "First dim for MXFP4 must be divisible by ",
+             MXFP4_BLOCK_SIZE, " (got shape=", shape, ")");
+  NVTE_CHECK(flat_last_dim % MXFP4_BLOCK_SIZE == 0,
+             "MXFP4 requires tensor dims that are divisible by ", MXFP4_BLOCK_SIZE,
+             " (got shape=", shape, ")");
+  const auto rowwise_scale_inv_shape = get_scale_shape(shape, false);
+  const auto columnwise_scale_inv_shape = get_scale_shape(shape, true);
+
+  // Allocate tensors
+  at::Tensor rowwise_data_tensor, rowwise_scale_inv_tensor, amax_rowwise;
+  at::Tensor columnwise_data_tensor, columnwise_scale_inv_tensor, amax_columnwise;
+  const auto bit8_tensor_opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+  const auto bit32_tensor_opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+  if (rowwise_usage) {
+    const std::vector<int64_t> scale_inv_shape_int64(rowwise_scale_inv_shape.begin(),
+                                                     rowwise_scale_inv_shape.end());
+#if MXFP4_SIMULATE_WITH_FP8
+    // Sim Mode: 1 element = 1 byte. Allocate full shape.
+    rowwise_data_tensor = at::empty(shape_int64, bit8_tensor_opts);
+#else
+    // Native Mode: Packed FP4. Allocate half shape.
+    rowwise_data_tensor = at::empty(convert_shape_for_fp4(shape_int64), bit8_tensor_opts);
+#endif
+    rowwise_scale_inv_tensor = at::empty(scale_inv_shape_int64, bit8_tensor_opts);
+    
+    // [FIX] Initialize amax to 1.0 explicitly (matching Python behavior) to avoid garbage values
+    amax_rowwise = at::ones({1}, bit32_tensor_opts);
+  }
+
+  if (columnwise_usage) {
+    const std::vector<int64_t> scale_inv_shape_int64(columnwise_scale_inv_shape.begin(),
+                                                     columnwise_scale_inv_shape.end());
+    // enforce 2D shape to avoid [S, B, H] shape and B and be 1
+    // and the transposed shape is [H, S, B], so divide last dim by 2 gives zero
+    std::vector<int64_t> shape_int64_2d = {static_cast<int64_t>(flat_first_dim),
+                                           static_cast<int64_t>(flat_last_dim)};
+    const auto transpose_shape_int64 = make_transpose_shape<int64_t>(shape_int64_2d);
+
+#if MXFP4_SIMULATE_WITH_FP8
+    // Sim Mode: 1 element = 1 byte. Allocate full transposed shape.
+    columnwise_data_tensor = at::empty(transpose_shape_int64, bit8_tensor_opts);
+#else
+    // Native Mode: Packed FP4. Allocate half transposed shape.
+    columnwise_data_tensor = at::empty(convert_shape_for_fp4(transpose_shape_int64), bit8_tensor_opts);
+#endif    
+    columnwise_scale_inv_tensor = at::empty(scale_inv_shape_int64, bit8_tensor_opts);
+    
+    // [FIX] Initialize amax to 1.0 explicitly
+    amax_columnwise = at::ones({1}, bit32_tensor_opts);
+  }
+
+  // Convert tensors to Python
+  auto py_cast = [](at::Tensor& tensor, bool need_cast) -> py::object {
+    return need_cast ? py::cast(tensor) : py::none();
+  };
+  auto rowwise_data_py = py_cast(rowwise_data_tensor, rowwise_usage);
+  auto rowwise_scale_inv_py = py_cast(rowwise_scale_inv_tensor, rowwise_usage);
+  auto columnwise_data_py = py_cast(columnwise_data_tensor, columnwise_usage);
+  auto columnwise_scale_inv_py = py_cast(columnwise_scale_inv_tensor, columnwise_usage);
+  auto amax_rowwise_py = py_cast(amax_rowwise, rowwise_usage);
+  auto amax_columnwise_py = py_cast(amax_columnwise, columnwise_usage);
+
+  // Construct Python MXFP4 tensor
+  py::object out_py;
+  if (internal) {
+    py::handle MXFP4TensorClass(reinterpret_cast<PyObject*>(MXFP4TensorStoragePythonClass));
+    out_py = MXFP4TensorClass(
+        "rowwise_data"_a = rowwise_data_py, "columnwise_data"_a = columnwise_data_py,
+        "rowwise_scale_inv"_a = rowwise_scale_inv_py,
+        "columnwise_scale_inv"_a = columnwise_scale_inv_py, "amax_rowwise"_a = amax_rowwise_py,
+        "amax_columnwise"_a = amax_columnwise_py, "fp4_dtype"_a = this->dtype,
+        "quantizer"_a = this->quantizer);
+  } else {
+    py::handle MXFP4TensorClass(reinterpret_cast<PyObject*>(MXFP4TensorPythonClass));
+    out_py = MXFP4TensorClass(
+        "shape"_a = shape_int64, "dtype"_a = GetATenDType(dtype),
+        "rowwise_data"_a = rowwise_data_py, "columnwise_data"_a = columnwise_data_py,
+        "rowwise_scale_inv"_a = rowwise_scale_inv_py,
+        "columnwise_scale_inv"_a = columnwise_scale_inv_py, "amax_rowwise"_a = amax_rowwise_py,
+        "amax_columnwise"_a = amax_columnwise_py, "fp4_dtype"_a = this->dtype,
+        "quantizer"_a = this->quantizer);
+  }
+
+  // Construct C++ tensor
+  TensorWrapper out_cpp(NVTE_MXFP4_1D_SCALING);
+  if (rowwise_usage) {
+    out_cpp.set_rowwise_data(rowwise_data_tensor.data_ptr(), DType::kFloat4E2M1, shape);
+    out_cpp.set_rowwise_scale_inv(rowwise_scale_inv_tensor.data_ptr(), DType::kFloat8E8M0,
+                                  rowwise_scale_inv_shape);
+    out_cpp.set_amax(amax_rowwise.data_ptr(), DType::kFloat32, std::vector<size_t>{1});
+  }
+  if (columnwise_usage) {
+    // enforce 2D shape to avoid [S, B, H] shape and B and be 1
+    // and the transposed shape is [H, S, B], so divide last dim by 2 gives zero
+    std::vector<size_t> shape_2d = {flat_first_dim, flat_last_dim};
+    auto col_data_shape_fp4 = make_transpose_shape<size_t>(shape_2d);
+    out_cpp.set_columnwise_data(columnwise_data_tensor.data_ptr(), DType::kFloat4E2M1,
+                                col_data_shape_fp4);
+    out_cpp.set_columnwise_scale_inv(columnwise_scale_inv_tensor.data_ptr(), DType::kFloat8E8M0,
+                                     columnwise_scale_inv_shape);
+    out_cpp.set_columnwise_amax(amax_columnwise.data_ptr(), DType::kFloat32,
+                                std::vector<size_t>{1});
+  }
+  this->set_quantization_params(&out_cpp);
+
+  return {std::move(out_cpp), std::move(out_py)};
+} 
+
+std::pair<TensorWrapper, py::object> MXFP4Quantizer::create_unquantized_tensor_with_amax(
+    TensorWrapper& quantized_tensor, DType dtype) {
+  // Construct tensor
+  auto shape = convertShape(quantized_tensor.shape());
+  auto [out_cpp, out_py] = NoneQuantizer(py::none()).create_tensor(shape, dtype);
+
+  // Register amax pointer from quantized tensor
+  void* amax_ptr = quantized_tensor.amax();
+  if (amax_ptr == nullptr) {
+    amax_ptr = quantized_tensor.get_columnwise_amax().data_ptr;
+  }
+  NVTE_CHECK(amax_ptr != nullptr, "Could not extract amax pointer from MXFP4 tensor.");
+  out_cpp.set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+
+  // Zero out amax
+  NVTE_CHECK_CUDA(cudaMemsetAsync(amax_ptr, 0, sizeof(float), at::cuda::getCurrentCUDAStream()));
+
+  return {std::move(out_cpp), std::move(out_py)};
+}
+
+std::pair<TensorWrapper, py::object> MXFP4Quantizer::convert_and_update_tensor(
+    py::object tensor) const {
+  NVTE_CHECK(detail::IsMXFP4Tensor(tensor.ptr()), "MXFP4Quantizer must output to IsMXFP4Tensor.");
+
+  // Extract buffers from Python tensor
+  auto get_tensor = [&tensor](const char* name) -> std::optional<at::Tensor> {
+    auto attr_py = tensor.attr(name);
+    if (attr_py.is_none()) {
+      return std::nullopt;
+    }
+    return attr_py.cast<at::Tensor>();
+  };
+  auto rowwise_data = get_tensor("_rowwise_data");
+  auto rowwise_scale_inv = get_tensor("_rowwise_scale_inv");
+  auto columnwise_data = get_tensor("_columnwise_data");
+  auto columnwise_scale_inv = get_tensor("_columnwise_scale_inv");
+  auto amax_rowwise = get_tensor("_amax_rowwise");
+  auto amax_columnwise = get_tensor("_amax_columnwise");
+  NVTE_CHECK(rowwise_data || columnwise_data, "MXFP4Tensor has no data.");
+
+  // Tensor dimensions, shape means original shape
+  std::vector<size_t> shape;
+  if (columnwise_data) {
+#if MXFP4_SIMULATE_WITH_FP8
+    // In Sim mode, columnwise is just transposed [N, M]. 
+    // We want logical shape [M, N], so just swap dims.
+    shape = make_transpose_shape(getTensorShape(*columnwise_data));
+#else
+    // In Native mode, data is Packed + Transposed. Convert back.
+    shape = convert_shape_back_from_fp4(getTensorShape(*columnwise_data), true);
+#endif
+    if (rowwise_data) {
+#if MXFP4_SIMULATE_WITH_FP8
+      // In Sim mode, rowwise is 1:1.
+      auto expected_shape = getTensorShape(*rowwise_data);
+#else
+      // In Native mode, data is Packed. Convert back.
+      auto expected_shape = convert_shape_back_from_fp4(getTensorShape(*rowwise_data), false);
+#endif
+      NVTE_CHECK(shape == expected_shape, "MXFP4 row-wise data (shape=", expected_shape,
+                 ") and column-wise data (shape=", shape, ") do not match");
+    }
+  } else {  // Already checked columnwise_data_tensor == true
+#if MXFP4_SIMULATE_WITH_FP8
+    shape = getTensorShape(*rowwise_data);
+#else
+    shape = convert_shape_back_from_fp4(getTensorShape(*rowwise_data), false);
+#endif
+  }
+
+  size_t flat_first_dim = 1;
+  if (shape.size() > 0) {
+    for (size_t i = 0; i < shape.size() - 1; ++i) {
+      flat_first_dim *= shape[i];
+    }
+  }
+  const size_t flat_last_dim = shape.size() > 0 ? shape.back() : 1;
+
+  // Coerce row-wise data
+  if (rowwise_usage) {
+    if (!rowwise_data) {
+      const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
+      const auto opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+#if MXFP4_SIMULATE_WITH_FP8
+      rowwise_data = at::empty(shape_int64, opts);
+#else
+      rowwise_data = at::empty(convert_shape_for_fp4(shape_int64), opts);
+#endif      
+      tensor.attr("_rowwise_data") = *rowwise_data;
+    }
+    if (!rowwise_scale_inv) {
+      const auto scale_inv_shape = get_scale_shape(shape, false);
+      const std::vector<int64_t> scale_inv_shape_int64(scale_inv_shape.begin(),
+                                                       scale_inv_shape.end());
+      const auto opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+      rowwise_scale_inv = at::empty(scale_inv_shape_int64, opts);
+      tensor.attr("_rowwise_scale_inv") = *rowwise_scale_inv;
+    }
+    if (!amax_rowwise) {
+      const auto opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+      amax_rowwise = at::empty({1}, opts);
+      tensor.attr("_amax_rowwise") = *amax_rowwise;
+    }
+  } else {  // rowwise_usage == false
+    if (rowwise_data) {
+      rowwise_data.reset();
+      tensor.attr("_rowwise_data") = py::none();
+    }
+    if (rowwise_scale_inv) {
+      rowwise_scale_inv.reset();
+      tensor.attr("_rowwise_scale_inv") = py::none();
+    }
+    if (amax_rowwise) {
+      amax_rowwise.reset();
+      tensor.attr("_amax_rowwise") = py::none();
+    }
+  }
+
+  // Coerce column-wise data
+  if (columnwise_usage) {
+    if (!columnwise_data) {
+      // enforce 2D shape to avoid [S, B, H] shape and B and be 1
+      // and the transposed shape is [H, S, B], so divide last dim by 2 gives zero
+      std::vector<int64_t> shape_int64_2d = {static_cast<int64_t>(flat_first_dim),
+                                             static_cast<int64_t>(flat_last_dim)};
+      const auto opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+      const auto transpose_shape_int64 = make_transpose_shape<int64_t>(shape_int64_2d);
+#if MXFP4_SIMULATE_WITH_FP8
+      columnwise_data = at::empty(transpose_shape_int64, opts);
+#else
+      columnwise_data = at::empty(convert_shape_for_fp4(transpose_shape_int64), opts);
+#endif
+      tensor.attr("_columnwise_data") = *columnwise_data;
+    }
+    if (!columnwise_scale_inv) {
+      const auto scale_inv_shape = get_scale_shape(shape, true);
+      const std::vector<int64_t> scale_inv_shape_int64(scale_inv_shape.begin(),
+                                                       scale_inv_shape.end());
+      const auto opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+      columnwise_scale_inv = at::empty(scale_inv_shape_int64, opts);
+      tensor.attr("_columnwise_scale_inv") = *columnwise_scale_inv;
+    }
+    if (!amax_columnwise) {
+      const auto opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+      amax_columnwise = at::zeros({1}, opts);
+      tensor.attr("_amax_columnwise") = *amax_columnwise;
+    }
+  } else {  // columnwise_usage == false
+    if (columnwise_data) {
+      columnwise_data.reset();
+      tensor.attr("_columnwise_data") = py::none();
+    }
+    if (columnwise_scale_inv) {
+      columnwise_scale_inv.reset();
+      tensor.attr("_columnwise_scale_inv") = py::none();
+    }
+    if (amax_columnwise) {
+      amax_columnwise.reset();
+      tensor.attr("_amax_columnwise") = py::none();
+    }
+  }
+
+  // Construct C++ tensor
+  TensorWrapper out_cpp(NVTE_MXFP4_1D_SCALING);
+  if (rowwise_usage) {
+    out_cpp.set_rowwise_data(rowwise_data->data_ptr(), DType::kFloat4E2M1, shape);
+    out_cpp.set_rowwise_scale_inv(rowwise_scale_inv->data_ptr(), DType::kFloat8E8M0,
+                                  getTensorShape(*rowwise_scale_inv));
+    out_cpp.set_amax(amax_rowwise->data_ptr(), DType::kFloat32, std::vector<size_t>{1});
+  }
+  if (columnwise_usage) {
+    // enforce 2D shape to avoid [S, B, H] shape and B and be 1
+    // and the transposed shape is [H, S, B], so divide last dim by 2 gives zero
+    std::vector<size_t> shape_2d = {flat_first_dim, flat_last_dim};
+    auto col_data_shape_fp4 = make_transpose_shape<size_t>(shape_2d);
+    out_cpp.set_columnwise_data(columnwise_data->data_ptr(), DType::kFloat4E2M1,
+                                col_data_shape_fp4);
+    out_cpp.set_columnwise_scale_inv(columnwise_scale_inv->data_ptr(), DType::kFloat8E8M0,
+                                     getTensorShape(*columnwise_scale_inv));
+    out_cpp.set_columnwise_amax(amax_columnwise->data_ptr(), DType::kFloat32,
+                                std::vector<size_t>{1});
+  }
+  this->set_quantization_params(&out_cpp);
+
+  return {std::move(out_cpp), std::move(tensor)};
+}
+
+void MXFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& out,
+                                   const std::optional<TensorWrapper>& noop_flag,
+                                   bool compute_amax) {
+  // Nothing to be done if input is empty
+  if (input.numel() == 0) {
+    return;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  QuantizationConfigWrapper quant_config;
+  if (noop_flag) {
+    quant_config.set_noop_tensor(noop_flag->data());
+  }
+  quant_config.set_nvfp4_2d_quantization(this->with_2d_quantization);
+  quant_config.set_stochastic_rounding(this->stochastic_rounding);
+  quant_config.set_global_scaling(this->global_scaling);
+  quant_config.set_encode_centric(this->encode_centric);
+   
+  // We only need RHT for columnwise usage.
+  // flat first dim and last dim for multi dimensional input
+  size_t rows = 1;
+  for (size_t i = 0; i < input.ndim() - 1; ++i) {
+    rows *= input.size(i);
+  }
+  size_t cols = input.size(input.ndim() - 1);
+
+  TensorWrapper te_rng_state;
+  if (this->stochastic_rounding) {
+    const size_t rng_elts_per_thread = 1024;  // Wild guess, probably can be tightened
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        std::nullopt, at::cuda::detail::getDefaultCUDAGenerator());
+    at::PhiloxCudaState philox_args = init_philox_state(gen, rng_elts_per_thread);
+    auto opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, opts);
+    philox_unpack(philox_args, static_cast<int64_t*>(rng_state.data_ptr()));
+    te_rng_state = makeTransformerEngineTensor(rng_state);
+    quant_config.set_rng_state(te_rng_state.data());
+  }
+
+  // Restriction for the RHT cast fusion kernel.
+  bool eligible_for_rht_cast_fusion =
+      input.dtype() == DType::kBFloat16 && rows % 64 == 0 && cols % 128 == 0;
+
+  // Compute amax.
+  if (this->with_rht) {
+    if (input.dtype() != DType::kBFloat16) {
+      NVTE_CHECK(false, "RHT is only supported for bfloat16 input");
+    }
+    if (compute_amax && this->with_post_rht_amax) {
+      // fprintf(stderr, "IN RHT amax\n");
+      // We need:
+      // 1. Rowwise amax = amax for input
+      // 2. Columnwise amax = amax for RHT(input.t)
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_hadamard_transform_amax(input.data(), out.data(), 0,
+                                     this->rht_matrix_random_sign_mask_t, stream);
+      });
+    } 
+  } else {  // Without RHT
+    if (compute_amax) {
+      // Amax pointers
+      auto rowwise_amax_ptr = out.get_amax().data_ptr;
+      auto columnwise_amax_ptr = out.get_columnwise_amax().data_ptr;
+      void* amax_ptr = rowwise_amax_ptr != nullptr ? rowwise_amax_ptr : columnwise_amax_ptr;
+      NVTE_CHECK(amax_ptr != nullptr, "Could not find amax pointer");
+
+      // Compute amax of input tensor
+      out.set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+      NVTE_SCOPED_GIL_RELEASE(
+          { nvte_compute_amax_with_config(input.data(), out.data(), quant_config, stream); });
+      out.set_amax(rowwise_amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+
+      // Make sure row-wise and column-wise amaxes match
+      if (rowwise_amax_ptr != amax_ptr && rowwise_amax_ptr != nullptr) {
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(rowwise_amax_ptr, amax_ptr, sizeof(float),
+                                        cudaMemcpyDeviceToDevice, stream));
+      }
+      if (columnwise_amax_ptr != amax_ptr && columnwise_amax_ptr != nullptr) {
+        NVTE_CHECK_CUDA(cudaMemcpyAsync(columnwise_amax_ptr, amax_ptr, sizeof(float),
+                                        cudaMemcpyDeviceToDevice, stream));
+      }
+    }
+  }
+
+  // amax reduction
+  if (compute_amax && this->with_amax_reduction) {
+    std::vector<at::Tensor> amax_tensors;
+    // push amax tensors inside if they need to be reduced
+    auto make_amax_tensor = [](void* data_ptr) {
+      return at::from_blob(
+          data_ptr, std::vector<int64_t>{1},
+          [](void*) {},  // deleter doing nothing since it doesn't own the data
+          at::device(at::kCUDA).dtype(torch::kFloat32));
+    };
+    if (rowwise_usage) {
+      amax_tensors.push_back(make_amax_tensor(out.get_amax().data_ptr));
+    }
+    if (columnwise_usage) {
+      amax_tensors.push_back(make_amax_tensor(out.get_columnwise_amax().data_ptr));
+    }
+    c10d::AllreduceCoalescedOptions opts;
+    opts.reduceOp = c10d::ReduceOp::MAX;
+    NVTE_SCOPED_GIL_RELEASE(
+        { this->amax_reduction_group->allreduce_coalesced(amax_tensors, opts)->wait(); });
+  }
+
+  if (this->with_rht) {
+    if (rowwise_usage) {
+      // For rowwise usage, we need to quantize the input directly, but we need to avoid quantizing columnwise
+      TensorWrapper out_identity(out.scaling_mode());
+      auto out_identity_data = out.get_rowwise_data();
+      auto out_identity_scale_inv = out.get_rowwise_scale_inv();
+      auto out_identity_amax = out.get_amax();
+      out_identity.set_rowwise_data(out_identity_data.data_ptr,
+                                    static_cast<DType>(out_identity_data.dtype),
+                                    out_identity_data.shape);
+      out_identity.set_rowwise_scale_inv(out_identity_scale_inv.data_ptr,
+                                         static_cast<DType>(out_identity_scale_inv.dtype),
+                                         out_identity_scale_inv.shape);
+      out_identity.set_amax(out_identity_amax.data_ptr, static_cast<DType>(out_identity_amax.dtype),
+                            out_identity_amax.shape);
+
+      NVTE_SCOPED_GIL_RELEASE(
+          { nvte_quantize_v2(input.data(), out_identity.data(), quant_config, stream); });
+    }
+
+    if (columnwise_usage) {
+      // Get the output columnwise data, scale_inv, and amax
+      auto out_columnwise_data = out.get_columnwise_data();
+      auto out_columnwise_scale_inv = out.get_columnwise_scale_inv();
+      // NOTE: should already be populated.
+      auto out_columnwise_amax = out.get_columnwise_amax();
+
+      // Create a wrapper for the columnwise output, as the rowwise output.
+      // The reason is due to the input `rht_output_t` is already in the transposed layout.
+      // Thus, we only need a rowwise quantization to generate the columnwise output.
+      TensorWrapper out_transpose(out.scaling_mode());
+      // Note: since we are faking columnwise tensor into rowwise, the flat first dim check will fail
+      // need to convert the shape to 2D here
+      auto colwise_data_shape = out_columnwise_data.shape;
+      std::vector<size_t> colwise_data_shape_2d;
+      // shape could be [512, 32, 64], that's actually 512, 32, 128 because 2 FP4 take 1 byte
+      // the 2D shape should be [512, 32*128], but columnwise data shape expect last dim to be halved again
+      // so the multiple 2 get cancelled out
+      colwise_data_shape_2d.push_back(colwise_data_shape.data[0]);
+      size_t last_dim = 1;
+      for (size_t i = 1; i < colwise_data_shape.ndim; ++i) {
+        last_dim *= colwise_data_shape.data[i];
+      }
+      colwise_data_shape_2d.push_back(last_dim);
+
+      out_transpose.set_rowwise_data(out_columnwise_data.data_ptr,
+                                     static_cast<DType>(out_columnwise_data.dtype),
+                                     colwise_data_shape_2d);
+      out_transpose.set_rowwise_scale_inv(out_columnwise_scale_inv.data_ptr,
+                                          static_cast<DType>(out_columnwise_scale_inv.dtype),
+                                          out_columnwise_scale_inv.shape);
+      out_transpose.set_amax(out_columnwise_amax.data_ptr,
+                             static_cast<DType>(out_columnwise_amax.dtype),
+                             out_columnwise_amax.shape);
+
+      if (true) {
+        // Invoking fallback RHT kernel.
+
+        // If using RHT, then amax will be computed in the RHT step
+        // If not using RHT, then amax will be computed based on input x
+        at::Tensor rht_output_t;  // The RHT(x_t) output, in columnwise layout
+        // This wrapper is going to be passed as input to the quantization kernel.
+        TensorWrapper rht_output_t_cpp;  // Wrapper to contain the RHT(x) and RHT(x_t) outputs
+        rht_output_t =
+            allocateTorchTensor(static_cast<int>(cols), static_cast<int>(rows), input.dtype());
+        // NOTE (frsun): This is non-intuitive, we are writing the
+        // result of transposed RHT to the output of rowwise.
+        rht_output_t_cpp.set_rowwise_data(rht_output_t.data_ptr(), input.dtype(),
+                                          std::vector<size_t>{cols, rows});
+
+        NVTE_SCOPED_GIL_RELEASE({
+          // Perform the RHT(input.t), and write to rht_output_cpp.columnwise.
+          nvte_hadamard_transform(input.data(), rht_output_t_cpp.data(), 0,
+                                  this->rht_matrix_random_sign_mask_t, stream);
+        });
+
+        // Quantize kernel will treat everything as rowwise input/output, which is
+        // intended.
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_quantize_v2(rht_output_t_cpp.data(), out_transpose.data(), quant_config, stream);
+        });
+      } else {
+        // fprintf(stderr, "IN RHT fuck\n");
+
+        // RHT cast fusion kernel.
+        NVTE_CHECK(this->rht_matrix.defined() && this->rht_matrix.numel() > 0,
+                   "RHT matrix is not set");
+        auto rht_matrix_nvte = makeTransformerEngineTensor(this->rht_matrix);
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_hadamard_transform_cast_fusion_columnwise(
+              input.data(), out_transpose.data(), rht_matrix_nvte.data(), quant_config, stream);
+        });
+      }
+    }
+  } else {
+    NVTE_SCOPED_GIL_RELEASE({ nvte_quantize_v2(input.data(), out.data(), quant_config, stream); });
+  }
+}
+
+void MXFP4Quantizer::quantize(const TensorWrapper& input, TensorWrapper& out,
+                              const std::optional<TensorWrapper>& noop_flag) {
+  // fprintf(stderr, "We're supposed to be here\n");
+  bool compute_amax = this->global_scaling;  
+  this->quantize_impl(input, out, noop_flag, compute_amax);
+}
+
+void MXFP4Quantizer::quantize_with_amax(TensorWrapper& input, TensorWrapper& out) {
+  // fprintf(stderr, "Fucking hell why is this even called\n");
+  // Update output tensor amaxes with input tensor amax
+  auto input_amax_ptr = input.amax();
+  auto output_rowwise_amax_ptr = out.get_amax().data_ptr;
+  auto output_columnwise_amax_ptr = out.get_columnwise_amax().data_ptr;
+  NVTE_CHECK(input_amax_ptr != nullptr ||
+                 (output_rowwise_amax_ptr == nullptr && output_columnwise_amax_ptr == nullptr),
+             "Input tensor does not have pre-computed amax");
+  if (input_amax_ptr != output_rowwise_amax_ptr && input_amax_ptr != nullptr &&
+      output_rowwise_amax_ptr != nullptr) {
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(output_rowwise_amax_ptr, input_amax_ptr, sizeof(float),
+                                    cudaMemcpyDeviceToDevice, at::cuda::getCurrentCUDAStream()));
+  }
+  if (input_amax_ptr != output_columnwise_amax_ptr && input_amax_ptr != nullptr &&
+      output_columnwise_amax_ptr != nullptr) {
+    NVTE_CHECK_CUDA(cudaMemcpyAsync(output_columnwise_amax_ptr, input_amax_ptr, sizeof(float),
+                                    cudaMemcpyDeviceToDevice, at::cuda::getCurrentCUDAStream()));
+  }
+  input.set_amax(nullptr, DType::kFloat32, input.defaultShape);
+
+  // Perform quantization
+  this->quantize_impl(input, out, std::nullopt, false);
+}
+
+std::vector<size_t> MXFP4Quantizer::get_scale_shape(const std::vector<size_t>& shape,
+                                                    bool columnwise) const {
+  size_t numel = 1;
+  for (auto s : shape) {
+    numel *= s;
+  }
+
+  auto last_dim = shape.back();
+  auto flat_first_dim = numel / last_dim;
+
+  NVTE_CHECK(last_dim % MXFP4_BLOCK_SIZE == 0, "Last dim for MXFP4 must be divisible by ",
+             MXFP4_BLOCK_SIZE, " (got dim=", last_dim, ")");
+  NVTE_CHECK(flat_first_dim % MXFP4_BLOCK_SIZE == 0,
+             "MXFP4 requires tensor dims that are divisible by ", MXFP4_BLOCK_SIZE,
+             " (got shape=", shape, ")");
+
+  std::vector<size_t> scale_shape;
+
+  bool rowwise_usage = !columnwise;
+
+  if (rowwise_usage) {
+    // rowwise scaling factor shape
+    size_t sinv0 = roundup(flat_first_dim, 128);
+    size_t sinv1 = roundup(last_dim / MXFP4_BLOCK_SIZE, 4);
+    scale_shape = {sinv0, sinv1};
+  } else {
+    // columnwise scaling factor shape
+    size_t sinv0 = roundup(last_dim, 128);
+    size_t sinv1 = roundup(flat_first_dim / MXFP4_BLOCK_SIZE, 4);
+    scale_shape = {sinv0, sinv1};
+  }
+  return scale_shape;
+}
+
+NVTEScalingMode MXFP4Quantizer::get_scaling_mode() const {
+  return NVTE_MXFP4_1D_SCALING;
 }
 
 }  // namespace transformer_engine::pytorch

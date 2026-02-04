@@ -43,7 +43,6 @@ class _FromNVFP4Func(torch.autograd.Function):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         # pylint: disable=missing-function-docstring
-
         # Dequantize row-wise data
         if tensor._rowwise_data is not None:
             ### TODO(tmoon): Debug dequantize kernel and remove unfused impl

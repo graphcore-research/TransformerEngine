@@ -54,7 +54,6 @@ def general_gemm(
     bulk_overlap: bool = False,
 ) -> Iterable[Optional[torch.Tensor]]:
     """GEMM supporting fp8 inputs."""
-
     assert layout in ("TN", "NN", "NT"), f"GEMM layout {layout} not supported."
     transa = layout[0] == "T"
     transb = layout[1] == "T"
@@ -118,7 +117,6 @@ def general_gemm(
             or B._data_format != tex.Float8BlockScaleTensorFormat.GEMM_READY
         ):
             raise RuntimeError("GEMM with Float8BlockwiseQTensor requires GEMM_READY format")
-
     args = (
         A,
         transa,  # transa

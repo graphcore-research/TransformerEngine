@@ -29,22 +29,19 @@ __global__ void __launch_bounds__(1)
 cudaDataType_t get_cuda_dtype(const transformer_engine::DType t) {
   using namespace transformer_engine;
   switch (t) {
-    case DType::kFloat16:
-      return CUDA_R_16F;
-    case DType::kFloat32:
-      return CUDA_R_32F;
-    case DType::kBFloat16:
-      return CUDA_R_16BF;
-    case DType::kFloat8E4M3:
-      return CUDA_R_8F_E4M3;
-    case DType::kFloat8E5M2:
-      return CUDA_R_8F_E5M2;
+    case DType::kFloat16: return CUDA_R_16F;
+    case DType::kFloat32: return CUDA_R_32F;
+    case DType::kBFloat16: return CUDA_R_16BF;
+    case DType::kFloat8E4M3: return CUDA_R_8F_E4M3;
+    case DType::kFloat8E5M2: return CUDA_R_8F_E5M2;
+    // [MXFP4 PATCH] Add E8M0 / Byte support
+    case DType::kByte: return CUDA_R_8U; 
+    case DType::kFloat8E8M0: return CUDA_R_8U; // Treat E8M0 as uint8 for storage
 #if CUDA_VERSION >= 12080
-    case DType::kFloat4E2M1:
-      return CUDA_R_4F_E2M1;
+    case DType::kFloat4E2M1: return CUDA_R_4F_E2M1;
 #endif
     default:
-      NVTE_ERROR("Invalid type");
+      NVTE_ERROR("Invalid type: ", to_string(t));
   }
 }
 
@@ -145,18 +142,29 @@ void checkCuDriverContext(CUstream stream) {
 CUtensorMapDataType get_CUtensorMapDataType(DType dtype) {
   static const std::unordered_map<DType, CUtensorMapDataType> dtypeMapping = []() {
     std::unordered_map<DType, CUtensorMapDataType> typeMapping = {
-        {DType::kByte, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
+        {DType::kByte, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}, // Already exists, good!
         {DType::kFloat32, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32},
         {DType::kFloat16, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16},
         {DType::kBFloat16, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16},
-        {DType::kFloat8E4M3, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8},
-        {DType::kFloat8E5M2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}};
+        {DType::kFloat8E4M3, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}, // FP8 uses UINT8 for TMA
+        {DType::kFloat8E5M2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8}
+    };
 #if FP4_TYPE_SUPPORTED
     typeMapping.insert(
         {DType::kFloat4E2M1, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B});
 #endif
+    
+    // [MXFP4 PATCH] Add E8M0 support
+    // If your enum has kFloat8E8M0, add this line:
+    typeMapping.insert({DType::kFloat8E8M0, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8});
+
     return typeMapping;
   }();
+  
+  // Robustness check
+  if (dtypeMapping.find(dtype) == dtypeMapping.end()) {
+      NVTE_ERROR("Unsupported data type for TMA: ", to_string(dtype));
+  }
   return dtypeMapping.at(dtype);
 }
 

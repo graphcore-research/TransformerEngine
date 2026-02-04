@@ -15,6 +15,13 @@
 #include "../util/logging.h"
 #include "transformer_engine/transformer_engine.h"
 
+// -------------------------------------------------------------------------
+// MXFP4 Simulation Flag
+// -------------------------------------------------------------------------
+#ifndef MXFP4_SIMULATE_WITH_FP8
+#define MXFP4_SIMULATE_WITH_FP8 1
+#endif
+
 namespace transformer_engine {
 namespace {
 
@@ -335,7 +342,8 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
   NVTE_CHECK(input->scaling_mode == NVTE_MXFP8_1D_SCALING ||
                  input->scaling_mode == NVTE_BLOCK_SCALING_1D ||
                  input->scaling_mode == NVTE_BLOCK_SCALING_2D ||
-                 input->scaling_mode == NVTE_NVFP4_1D_SCALING,
+                 input->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+                 input->scaling_mode == NVTE_MXFP4_1D_SCALING, // Added MXFP4
              "Input tensor has invalid scaling mode (", to_string(input->scaling_mode), ").");
   NVTE_CHECK(is_fp8_dtype(input->dtype()) || is_fp4_dtype(input->dtype()),
              "Input tensor has invalid dtype (", to_string(input->dtype()), ").");
@@ -349,18 +357,28 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
   CheckInputTensor(*output, "scaling_factor_output");
 
   auto& scaling_mode = input->scaling_mode;
-  NVTE_CHECK(scaling_mode == NVTE_MXFP8_1D_SCALING || scaling_mode == NVTE_NVFP4_1D_SCALING,
+  NVTE_CHECK(scaling_mode == NVTE_MXFP8_1D_SCALING || 
+             scaling_mode == NVTE_NVFP4_1D_SCALING || 
+             scaling_mode == NVTE_MXFP4_1D_SCALING, // Added MXFP4
              "Unsupported scaling mode for swizzling.");
 
   bool nvfp4 = scaling_mode == NVTE_NVFP4_1D_SCALING;
+  bool mxfp4 = scaling_mode == NVTE_MXFP4_1D_SCALING;
 
   // 1D block scaling, row-wise or colum-wise
+  bool is_simulated_mxfp4 = false;
+#if MXFP4_SIMULATE_WITH_FP8
+  if (mxfp4) is_simulated_mxfp4 = true;
+#endif
+
   int m, k;
   if (input->has_data()) {
     m = input->scale_inv.shape[0];
     k = input->scale_inv.shape[1];
   } else {
-    if (nvfp4) {
+    // [FIX] For Simulated MXFP4, we must read the physical dimensions (N, K_block)
+    // and ignore the Logical Swap that common.h is now doing.
+    if (nvfp4 || is_simulated_mxfp4) {
       m = input->columnwise_scale_inv.shape[0];
       k = input->columnwise_scale_inv.shape[1];
     } else {
@@ -368,7 +386,6 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
       k = input->columnwise_scale_inv.shape[0];
     }
   }
-
   constexpr int SF_TILE_DIM_M = 128;
   constexpr int SF_TILE_DIM_K = 4;
 
@@ -392,8 +409,8 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
   int num_tiles_k = k / SF_TILE_DIM_K;
 
   // For NVFP4, the scale inverse for tranposed data needs rowwise swizzle.
-  const bool rowwise_swizzle = input->has_data() || nvfp4;
-  const bool columnwise_swizzle = input->has_columnwise_data() && !nvfp4;
+  const bool rowwise_swizzle = input->has_data() || nvfp4 || is_simulated_mxfp4;
+  const bool columnwise_swizzle = input->has_columnwise_data() && !nvfp4 && !is_simulated_mxfp4;
 
   dim3 block_size(TB_DIM, TB_DIM);
   if (rowwise_swizzle) {
@@ -407,18 +424,22 @@ void swizzle_scaling_factors(const Tensor* input, Tensor* output, cudaStream_t s
     int original_M, original_K;
     void *input_scale_inv_ptr, *output_scale_inv_ptr;
 
-    if (!nvfp4 || input->has_data()) {
-      int block_scale_size = nvfp4 ? NVFP4_BLOCK_SIZE : MXFP8_BLOCK_SIZE;
+    int block_scale_size = nvfp4 ? NVFP4_BLOCK_SIZE : MXFP8_BLOCK_SIZE;  // MXFP4-sim uses 32 here
+
+    if (input->has_data()) {
+      // swizzling scale_inv (normal rowwise case)
       original_M = input->flat_first_dim();
       original_K = input->flat_last_dim() / block_scale_size;
-      input_scale_inv_ptr = input->scale_inv.dptr;
+      input_scale_inv_ptr  = input->scale_inv.dptr;
       output_scale_inv_ptr = output->scale_inv.dptr;
     } else {
-      original_M = input->flat_last_dim();
-      original_K = input->flat_first_dim() / NVFP4_BLOCK_SIZE;
-      input_scale_inv_ptr = input->columnwise_scale_inv.dptr;
+      // swizzling columnwise_scale_inv as a "rowwise swizzle" (NVFP4 + simulated MXFP4 case)
+      original_M = input->flat_last_dim();                    // K
+      original_K = input->flat_first_dim() / block_scale_size; // M / block
+      input_scale_inv_ptr  = input->columnwise_scale_inv.dptr;
       output_scale_inv_ptr = output->columnwise_scale_inv.dptr;
     }
+
 
     switch (vec_load_size) {
       case 4:
@@ -644,8 +665,8 @@ void multi_tensor_swizzle_scaling_factors(const std::vector<Tensor*>& input,
       kernel_args.output_list[pos] = output[i]->scale_inv.dptr;
       kernel_args.m_list[pos] = m;
       kernel_args.k_list[pos] = k;
-      kernel_args.original_m_list[pos] = input[i]->flat_first_dim();
-      kernel_args.original_k_list[pos] = input[i]->flat_last_dim() / MXFP8_BLOCK_SIZE;
+      kernel_args.original_m_list[pos] = input[i]->flat_last_dim(); 
+      kernel_args.original_k_list[pos] = input[i]->flat_first_dim() / MXFP8_BLOCK_SIZE;
       kernel_args.num_tensors++;
     }
     // Launch the remaining tensors
@@ -656,6 +677,14 @@ void multi_tensor_swizzle_scaling_factors(const std::vector<Tensor*>& input,
   }
 
   if (all_has_columnwise_data) {
+    bool is_simulated_mxfp4 = false;
+#if MXFP4_SIMULATE_WITH_FP8
+    // Check if any tensor (or the first one, assuming homogeneity) is MXFP4
+    if (input[0]->scaling_mode == NVTE_MXFP4_1D_SCALING) {
+        is_simulated_mxfp4 = true;
+    }
+#endif
+
     MultiSwizzleArgs kernel_args;
     kernel_args.num_tensors = 0;
     kernel_args.block_range[0] = 0;
@@ -665,15 +694,27 @@ void multi_tensor_swizzle_scaling_factors(const std::vector<Tensor*>& input,
       if (kernel_args.num_tensors == kMaxTensorsPerKernel) {
         // There is no int3 and misaligned if using int4/int2.
         if (vec_load_size == 3) vec_load_size = 1;
+        
+        // Pass is_simulated_mxfp4 ? true (rowwise logic) : false (colwise logic)
         launch_multi_tensor_swizzle_scaling_factors<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-            kernel_args, vec_load_size, false, stream);
+            kernel_args, vec_load_size, is_simulated_mxfp4 ? true : false, stream);
+            
         // Reset the argument struct and vec_load_size
         kernel_args.num_tensors = 0;
         vec_load_size = 4;
       }
-      const int m = input[i]->columnwise_scale_inv.shape[1];
-      const int k = input[i]->columnwise_scale_inv.shape[0];
-
+      int m, k;
+      if (is_simulated_mxfp4) {
+          // For MXFP4 simulation, we treat columnwise scales as a standard Row-Major matrix
+          // of shape (N, K/BlockSize). We want to swizzle the K/BlockSize dimension.
+          // So m = Rows (N), k = Cols (K/BlockSize).
+          m = input[i]->columnwise_scale_inv.shape[0];
+          k = input[i]->columnwise_scale_inv.shape[1];
+      } else {
+          // Standard TE behavior for columnwise (swaps dimensions)
+          m = input[i]->columnwise_scale_inv.shape[1];
+          k = input[i]->columnwise_scale_inv.shape[0];
+      }
       NVTE_CHECK(m % SF_TILE_DIM_M == 0, "Input should be padded in M/N dimension!");
       NVTE_CHECK(k % SF_TILE_DIM_K == 0, "Input should be padded in K dimension!");
       NVTE_CHECK(k > 0, "Input scale inverse should be 2D!");
@@ -684,24 +725,35 @@ void multi_tensor_swizzle_scaling_factors(const std::vector<Tensor*>& input,
                  "Output.columnwise_scale_inv size!");
 
       int num_tiles_k = k / SF_TILE_DIM_K;
+      // If simulated MXFP4, we are swapping dims logic ONLY for originals.
+      // NOTE: [Fix] Use num_tiles_k (contiguous dim) for vec_load_size logic
       int vec_load_size_i = (num_tiles_k - 1) % 4 + 1;
-      // We use the minimum vec_load_size across all tensors.
       vec_load_size = std::min(vec_load_size, vec_load_size_i);
 
       const int pos = kernel_args.num_tensors;
       kernel_args.input_list[pos] = const_cast<void*>(input[i]->columnwise_scale_inv.dptr);
       kernel_args.output_list[pos] = output[i]->columnwise_scale_inv.dptr;
-      kernel_args.m_list[pos] = m;
-      kernel_args.k_list[pos] = k;
-      kernel_args.original_m_list[pos] = input[i]->flat_last_dim();
-      kernel_args.original_k_list[pos] = input[i]->flat_first_dim() / MXFP8_BLOCK_SIZE;
+      
+      if (is_simulated_mxfp4) {
+          // NOTE: [Fix] Do NOT swap m and k for the physical dimension args.
+          // m is already N (Rows of transposed), k is already K (Cols of transposed).
+          kernel_args.m_list[pos] = m; // NO SWAP
+          kernel_args.k_list[pos] = k; // NO SWAP
+          kernel_args.original_m_list[pos] = input[i]->flat_first_dim(); 
+          kernel_args.original_k_list[pos] = input[i]->flat_last_dim() / MXFP8_BLOCK_SIZE;
+      } else {
+          kernel_args.m_list[pos] = m;
+          kernel_args.k_list[pos] = k;
+          kernel_args.original_m_list[pos] = input[i]->flat_last_dim();
+          kernel_args.original_k_list[pos] = input[i]->flat_first_dim() / MXFP8_BLOCK_SIZE;
+      }
       kernel_args.num_tensors++;
     }
     // Launch the remaining tensors
     // There is no int3 and misaligned if using int4/int2.
     if (vec_load_size == 3) vec_load_size = 1;
     launch_multi_tensor_swizzle_scaling_factors<SF_TILE_DIM_M, SF_TILE_DIM_K>(
-        kernel_args, vec_load_size, false, stream);
+        kernel_args, vec_load_size, is_simulated_mxfp4 ? true : false, stream);
   }
 }
 }  // namespace transformer_engine

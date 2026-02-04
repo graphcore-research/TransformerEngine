@@ -72,6 +72,9 @@ class QParams:
     random_hadamard_transform: bool = False
     stochastic_rounding: bool = False
     fp4_2d_quantization: bool = False
+    global_scaling: bool = False
+    encode_centric: bool = False
+    
 
     def __repr__(self) -> str:
         return (
@@ -79,7 +82,9 @@ class QParams:
             f"amax_epsilon={self.amax_epsilon},\n"
             f"random_hadamard_transform={self.random_hadamard_transform},\n"
             f"stochastic_rounding={self.stochastic_rounding},\n"
-            f"fp4_2d_quantization={self.fp4_2d_quantization}\n)"
+            f"fp4_2d_quantization={self.fp4_2d_quantization},\n)"
+            f"global_scaling={self.global_scaling},\n)"
+            f"encode_centric={self.encode_centric},\n)"
         )
 
 
@@ -111,7 +116,11 @@ class Recipe:
     def float8_block_scaling(self):
         """Whether the given recipe is float8 blockwise scaling."""
         return isinstance(self, Float8BlockScaling)
-
+    
+    def mxfp4(self):
+        """Whether the given recipe is MXFP4 block scaling."""
+        return isinstance(self, MXFP4BlockScaling)
+    
     def custom(self):
         """Whether the given recipe is custom."""
         return isinstance(self, CustomRecipe)
@@ -436,6 +445,7 @@ class NVFP4BlockScaling(Recipe):
         os.getenv("NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "0") == "1"
     )
     disable_2d_quantization: bool = os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
+    encode: bool = os.getenv("NVTE_NVFP4_ENCODE_CENTRIC", "0") == "1"
 
     fp4_format: Format = Format.E2M1
     fp8_format: Format = Format.E4M3
@@ -455,16 +465,19 @@ class NVFP4BlockScaling(Recipe):
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=False,
             fp4_2d_quantization=False,
+            encode_centric=self.encode
         )
         self.fp4_quant_fwd_weight = QParams(
             random_hadamard_transform=False,
             stochastic_rounding=False,
             fp4_2d_quantization=not self.disable_2d_quantization,
+            encode_centric=self.encode
         )
         self.fp4_quant_bwd_grad = QParams(
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=not self.disable_stochastic_rounding,
             fp4_2d_quantization=False,
+            encode_centric=self.encode
         )
 
     def __repr__(self) -> str:
@@ -480,6 +493,88 @@ class NVFP4BlockScaling(Recipe):
         )
 
 
+
+@dataclass()
+class MXFP4BlockScaling(Recipe):
+    """
+    Use the MXFP4 scaling strategy.
+
+    This recipe is similar to NVFP4BlockScaling but enforces power-of-2 scaling
+    factors (E8M0) for the quantization parameters.
+
+    Parameters
+    ----------
+    fp4_format : {Format.E2M1}, default = Format.E2M1
+             FP4 data type.
+    disable_rht : bool, default = `False`
+             If set to `True`, random Hadamard transforms are not applied to any tensor.
+    disable_stochastic_rounding : bool, default = `False`
+             If set to `True`, stochastic rounding is disabled during quantization for all tensors.
+    disable_2d_quantization : bool, default = `False`
+             If set to `True`, 1D block scaling with block size 16 is used for all tensors.
+    """
+
+    # Configuration envvars
+    disable_rht: bool = os.getenv("NVTE_MXFP4_DISABLE_RHT", "0") == "1"
+    disable_stochastic_rounding: bool = (
+        os.getenv("NVTE_MXFP4_DISABLE_STOCHASTIC_ROUNDING", "0") == "1"
+    )
+    disable_2d_quantization: bool = os.getenv("NVTE_MXFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
+
+    global_scaling: bool = os.getenv("NVTE_MXFP4_GLOBAL_SCALING", "0") == "1"
+    encode: bool = os.getenv("NVTE_MXFP4_ENCODE_CENTRIC", "0") == "1"
+    disable_2d_quantization: bool = os.getenv("NVTE_MXFP4_DISABLE_2D_QUANTIZATION", "0") == "1" 
+    fp4_format: Format = Format.E4M3
+    fp8_format: Format = Format.E4M3
+
+    # Not applying quantization to attention for now
+    fp8_dpa: bool = False
+    fp8_mha: bool = False
+
+    def __post_init__(self) -> None:
+        # assert self.fp4_format == Format.E2M1, "Only E2M1 is supported for MXFP4 scaling"
+        # assert self.fp8_format == Format.E4M3, "Only E4M3 is supported for MXFP4 scaling"
+
+        # Quantization params
+        # Explicitly setting power_2_scale=True for all QParams
+        self.fp4_quant_fwd_inp = QParams(
+            power_2_scale=True,
+            random_hadamard_transform=not self.disable_rht,
+            stochastic_rounding=False,
+            fp4_2d_quantization=False,
+            global_scaling=self.global_scaling,
+            encode_centric=self.encode
+
+        )
+        self.fp4_quant_fwd_weight = QParams(
+            power_2_scale=True,
+            random_hadamard_transform=False,
+            stochastic_rounding=False,
+            fp4_2d_quantization=not self.disable_2d_quantization,
+            global_scaling=self.global_scaling,
+            encode_centric=self.encode,
+        )
+        self.fp4_quant_bwd_grad = QParams(
+            power_2_scale=True,
+            random_hadamard_transform=not self.disable_rht,
+            stochastic_rounding=not self.disable_stochastic_rounding,
+            fp4_2d_quantization=False,
+            global_scaling=self.global_scaling,
+            encode_centric=self.encode
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"recipe_type={self.__class__.__name__}, "
+            f"fp4_format={str(self.fp4_format).split('.')[1]}, "
+            f"fp8_format={str(self.fp8_format).split('.')[1]}, "
+            f"fp8_dpa={self.fp8_dpa}, "
+            f"fp8_mha={self.fp8_mha}, "
+            f"fp4_quant_fwd_inp={self.fp4_quant_fwd_inp}, "
+            f"fp4_quant_fwd_weight={self.fp4_quant_fwd_weight}, "
+            f"fp4_quant_bwd_grad={self.fp4_quant_bwd_grad}, "
+        )
+    
 @dataclass()
 class CustomRecipe(Recipe):
     """
@@ -512,3 +607,4 @@ class CustomRecipe(Recipe):
 
     def __repr__(self) -> str:
         return f"recipe_type={self.__class__.__name__}, qfactory={self.qfactory}"
+

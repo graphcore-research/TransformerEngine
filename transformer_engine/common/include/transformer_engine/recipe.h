@@ -126,6 +126,11 @@ void nvte_nvfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_r
                                          const NVTETensor inpB, const bool use_rowwise_amax_B,
                                          float alpha_in, NVTETensor alpha_out, cudaStream_t stream);
 
+void nvte_mxfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_rowwise_amax_A,
+                                         const NVTETensor inpB, const bool use_rowwise_amax_B,
+                                         float alpha_in, NVTETensor alpha_out,
+                                         cudaStream_t stream);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

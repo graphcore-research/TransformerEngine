@@ -128,6 +128,11 @@ std::vector<py::object> layernorm_fwd(py::handle input, py::handle weight, Maybe
       // TE kernel supports amax output
       impl = Impl::FUSED_NORM_AMAX_NVFP4;
     }
+  } else if (detail::IsMXFP4Quantizers(quantizer.ptr())) {
+    // [MXFP4 Support]
+    // MXFP4 does not support fused normalization kernels yet.
+    // Use unfused path: Compute norm in HP -> Quantize to MXFP4 explicitly.
+    impl = Impl::UNFUSED;
   }
 
   // Construct unquantized output tensor if needed
@@ -352,6 +357,11 @@ std::vector<py::object> rmsnorm_fwd(const py::handle &input, const py::handle &w
       // TE kernel supports amax output
       impl = Impl::FUSED_NORM_AMAX_NVFP4;
     }
+  } else if (detail::IsMXFP4Quantizers(quantizer.ptr())) {
+    // [MXFP4 Support]
+    // MXFP4 does not support fused normalization kernels yet.
+    // Use unfused path: Compute norm in HP -> Quantize to MXFP4 explicitly.
+    impl = Impl::UNFUSED;
   }
 
   // Construct unquantized output tensor if needed

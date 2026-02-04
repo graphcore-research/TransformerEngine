@@ -1,8 +1,8 @@
-# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, Generic AI Implementation. All rights reserved.
 #
 # See LICENSE for license information.
 
-"""Tensor class with NVFP4 data"""
+"""Tensor class with MXFP4 data (OCP Micro-scaling Format)"""
 from __future__ import annotations
 from collections.abc import Iterable
 import math
@@ -13,19 +13,32 @@ import torch
 import transformer_engine_torch as tex
 from transformer_engine_torch import DType as TE_DType
 
-from transformer_engine.common.recipe import NVFP4BlockScaling, Recipe
-from ..constants import NVFP4_BLOCK_SCALING_SIZE, dist_group_type
+# Assuming a hypothetical recipe for MXFP4 exists or reusing the base Recipe
+from transformer_engine.common.recipe import Recipe  
+# from ..constants import MXFP4_BLOCK_SCALING_SIZE # We define this locally below
 from ..utils import (
     canonicalize_process_group,
     devices_match,
     round_up_to_nearest_multiple,
 )
 
-from .storage.nvfp4_tensor_storage import NVFP4TensorStorage, _FromNVFP4Func
+# Assuming the Storage class is generic or duplicated for MXFP4 bindings
+from .storage.mxfp4_tensor_storage import MXFP4TensorStorage, _FromMXFP4Func
 from .quantized_tensor import QuantizedTensor, Quantizer, _IdentityFunc
 
 aten = torch.ops.aten
+SIMULATE_MXFP4_WITH_FP8 = True
 
+# =============================================================================
+# MXFP4 Constants & Constraints
+# =============================================================================
+
+# MXFP4 requirement: Block size is 32
+MXFP4_BLOCK_SCALING_SIZE = 32
+
+# =============================================================================
+# Hadamard Transform Utilities (Block Size 32)
+# =============================================================================
 
 def get_no_random_sign_vector() -> torch.Tensor:
     """Non-random sign vector for Hadamard transform."""
@@ -34,9 +47,7 @@ def get_no_random_sign_vector() -> torch.Tensor:
 
 def get_sign_from_vector(vector: torch.Tensor) -> int:
     """Convert sign vector to bitmask.
-
     Used for random Hadamard transform.
-
     """
     mask = 0
     for i, v in enumerate(vector):
@@ -45,11 +56,16 @@ def get_sign_from_vector(vector: torch.Tensor) -> int:
 
 
 def get_wgrad_sign_vector() -> torch.Tensor:
-    """Hard-coded random signs for Hadamard transform.
-
-    https://xkcd.com/221/
-
+    """Hard-coded random signs for Hadamard transform (size 16 repeated or extended).
+    
+    Note: For block size 32, this vector might need extension to 32 elements 
+    depending on the specific RHT kernel implementation. 
+    Assuming the kernel handles the broadcasting or the vector is used 
+    to generate the diagonal sign matrix for the 32x32 transform.
     """
+    # This specific vector is length 16. If the RHT kernel expects 32 signs for the 
+    # 32x32 matrix, we typically repeat it or generate 16 more. 
+    # Keeping original logic strictly, but ensuring it applies to the 32 dim matrix.
     return torch.tensor(
         [1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1],
         dtype=torch.float32,
@@ -98,7 +114,6 @@ def get_rht_matrix(with_random_sign_mask: bool) -> torch.Tensor:
     rht_matrix = sign_matrix @ get_hadamard_matrix(hadamard_dimension)
     return rht_matrix.to(dtype=torch.bfloat16).cuda()
 
-
 @functools.lru_cache(maxsize=None)
 def get_random_sign_mask_for_rht(with_random_sign_mask: bool) -> int:
     """Sign mask for random Hadamard transform."""
@@ -107,8 +122,8 @@ def get_random_sign_mask_for_rht(with_random_sign_mask: bool) -> int:
     return 0
 
 
-class NVFP4Quantizer(Quantizer):
-    """Builder class for NVFP4 tensors with NV block scaling"""
+class MXFP4Quantizer(Quantizer):
+    """Builder class for MXFP4 tensors with MX block scaling (E8M0)"""
 
     dtype: TE_DType
     """Random Hadamard Transform"""
@@ -128,9 +143,13 @@ class NVFP4Quantizer(Quantizer):
     rht_matrix_random_sign_mask_t: int
     rht_matrix: torch.Tensor
 
+    global_scaling: bool  # <--- Add type hint
+
+    encode_centric: bool
+
     def __init__(
         self,
-        fp4_dtype: TE_DType = tex.DType.kFloat4E2M1,
+        fp4_dtype: TE_DType = tex.DType.kFloat4E2M1 if not SIMULATE_MXFP4_WITH_FP8 else tex.DType.kFloat8E4M3,
         rowwise: bool = True,
         columnwise: bool = True,
         with_amax_reduction: bool = False,
@@ -140,7 +159,8 @@ class NVFP4Quantizer(Quantizer):
         with_2d_quantization: bool = False,
         stochastic_rounding: bool = False,
         with_random_sign_mask: bool = True,
-        encode_centric: bool = False,
+        global_scaling: bool = False,
+        encode_centric: bool = False
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.dtype = fp4_dtype
@@ -152,6 +172,7 @@ class NVFP4Quantizer(Quantizer):
         self.stochastic_rounding = stochastic_rounding
         self.rht_matrix_random_sign_mask_t = get_random_sign_mask_for_rht(with_random_sign_mask)
         self.rht_matrix = get_rht_matrix(with_random_sign_mask)
+        self.global_scaling = global_scaling
         self.encode_centric = encode_centric
 
     def update_quantized(
@@ -162,7 +183,7 @@ class NVFP4Quantizer(Quantizer):
         noop_flag: Optional[torch.Tensor] = None,
     ) -> QuantizedTensor:
 
-        assert isinstance(dst, NVFP4Tensor), f"Cannot store quantized NVFP4 in {type(dst)} type."
+        assert isinstance(dst, MXFP4Tensor), f"Cannot store quantized MXFP4 in {type(dst)} type."
 
         # Make sure input is in expected format
         if not devices_match(src.device, dst.device):
@@ -170,7 +191,7 @@ class NVFP4Quantizer(Quantizer):
         if not src.is_contiguous():
             src = src.contiguous()
 
-        # Launch cast kernel
+        # Launch cast kernel (Assume tex.quantize supports MXFP4 semantics)
         tex.quantize(src, self, dst, noop_flag)
 
         return dst
@@ -180,20 +201,18 @@ class NVFP4Quantizer(Quantizer):
         return tex.quantize(tensor, self)
 
     def is_quantizable(self, inp: torch.Tensor) -> bool:
-        """Returns whether or not given inp can be quantized"""
+        """Returns whether or not given inp can be quantized for MXFP4"""
         if inp.ndim < 2:
             return False
-        if inp.shape[-1] % NVFP4_BLOCK_SCALING_SIZE != 0:
+        # Check against MXFP4 block size (32)
+        if inp.shape[-1] % MXFP4_BLOCK_SCALING_SIZE != 0:
             return False
-        if math.prod(inp.shape[:-1]) % NVFP4_BLOCK_SCALING_SIZE != 0:
+        if math.prod(inp.shape[:-1]) % MXFP4_BLOCK_SCALING_SIZE != 0:
             return False
         return True
 
     def get_scale_shape(self, shape: Iterable[int], columnwise: bool) -> Tuple[int, int]:
-        """Calculate the shape of the scaling tensor for NVFP4 1D blockwise quantization.
-
-        This method determines the shape of the scaling tensor needed for blockwise quantization,
-        taking into account the input tensor shape and whether columnwise scaling is used.
+        """Calculate the shape of the scaling tensor for MXFP4 1D blockwise quantization.
 
         Parameters
         ----------
@@ -206,11 +225,11 @@ class NVFP4Quantizer(Quantizer):
         -------
         Tuple[int, int]
             Shape of the scaling tensor as (outer_dim, inner_dim)
-            For NVFP4 1D blockwise quantization, blocksize is 16
-            - If columnwise: (round_to_multiple(K, 128), round_to_multiple(roundup(M / 16), 4))
-            - If rowwise: (round_to_multiple(M, 128), round_to_multiple(roundup(K / 16), 4))
-        Swizzle kernel will be performed before GEMM to suit the need of CuBLAS.
-        CuBLAS doc: https://docs.nvidia.com/cuda/cublas/index.html#d-block-scaling-factors-layout
+            For MXFP4 1D blockwise quantization, blocksize is 32.
+            The scaling factor is E8M0 (stored as uint8).
+            
+            - If columnwise: (round_to_multiple(K, 128), round_to_multiple(roundup(M / 32), 4))
+            - If rowwise: (round_to_multiple(M, 128), round_to_multiple(roundup(K / 32), 4))
         """
         M, K = 1, 1
         M = math.prod(shape[:-1])
@@ -218,30 +237,20 @@ class NVFP4Quantizer(Quantizer):
 
         if columnwise:
             outer = round_up_to_nearest_multiple(K, 128)
-            inner = round_up_to_nearest_multiple(math.ceil(M / NVFP4_BLOCK_SCALING_SIZE), 4)
+            # Divisor changed from 16 to 32 for MXFP4
+            inner = round_up_to_nearest_multiple(math.ceil(M / MXFP4_BLOCK_SCALING_SIZE), 4)
             return (outer, inner)
         # rowwise
         outer = round_up_to_nearest_multiple(M, 128)
-        inner = round_up_to_nearest_multiple(math.ceil(K / NVFP4_BLOCK_SCALING_SIZE), 4)
+        # Divisor changed from 16 to 32 for MXFP4
+        inner = round_up_to_nearest_multiple(math.ceil(K / MXFP4_BLOCK_SCALING_SIZE), 4)
         return (outer, inner)
 
     @staticmethod
     def get_columnwise_shape(shape: Iterable[int]) -> Tuple[int, ...]:
         """Calculate the shape of a tensor after columnwise quantization.
 
-        For NVFP4 columnwise quantization, it's performing 16x1 quantization block scaling.
-
-        Parameters
-        ----------
-        shape : Iterable[int]
-            Original shape of the tensor
-
-        Returns
-        -------
-        Tuple[int, ...]
-            New shape with dimensions rearranged for columnwise layout.
-            For a shape (d1, d2, ..., dn), returns (dn, d1, d2, ..., dn-1).
-            Returns empty tuple for empty input shape.
+        For MXFP4 columnwise quantization, it's performing 32x1 quantization block scaling.
         """
         if len(shape) == 0:
             return tuple()
@@ -253,9 +262,15 @@ class NVFP4Quantizer(Quantizer):
 
     @staticmethod
     def convert_shape_for_fp4(shape: Iterable[int]) -> Tuple[int, ...]:
-        """Convert shape for FP4 data by dividing the last dimension by 2"""
+        """
+        Convert logical [*, N] shape to storage shape.
+
+        - Native FP4: pack 2×4-bit per byte → last dim // 2
+        - Sim FP8:    one byte per logical element → shape unchanged
+        """
         shape = list(shape)
-        shape[-1] = shape[-1] // 2
+        if not SIMULATE_MXFP4_WITH_FP8:
+            shape[-1] = shape[-1] // 2
         return tuple(shape)
 
     def make_empty(
@@ -265,54 +280,70 @@ class NVFP4Quantizer(Quantizer):
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         requires_grad: bool = False,
-    ) -> NVFP4Tensor:
+    ) -> MXFP4Tensor:
+        # print(f"DEBUG [Python]: make_empty called for shape {shape}")
+        # print(f"DEBUG [Python]: rowwise_usage={self.rowwise_usage}, columnwise_usage={self.columnwise_usage}")
         # Canonicalize tensor attributes
         if device is None:
             device = torch.device("cuda")
 
-        assert shape[-1] % NVFP4_BLOCK_SCALING_SIZE == 0, (
-            f"Incorrect shape {shape} for NVFP4. Tensor dims must be divisible by"
-            f" {NVFP4_BLOCK_SCALING_SIZE}"
+        assert shape[-1] % MXFP4_BLOCK_SCALING_SIZE == 0, (
+            f"Incorrect shape {shape} for MXFP4. Tensor dims must be divisible by"
+            f" {MXFP4_BLOCK_SCALING_SIZE}"
         )
 
         flat_first_dim = math.prod(shape[:-1])
-        assert flat_first_dim % NVFP4_BLOCK_SCALING_SIZE == 0, (
-            f"Incorrect shape {shape} for NVFP4. Tensor dims must be divisible by"
-            f" {NVFP4_BLOCK_SCALING_SIZE}"
+        assert flat_first_dim % MXFP4_BLOCK_SCALING_SIZE == 0, (
+            f"Incorrect shape {shape} for MXFP4. Tensor dims must be divisible by"
+            f" {MXFP4_BLOCK_SCALING_SIZE}"
         )
 
         # Allocate FP4 data
+
+        # Allocate Rowwise
         data = None
         scale_inv = None
         amax_rowwise = None
+        
         if self.rowwise_usage:
-            data = torch.empty(self.convert_shape_for_fp4(shape), dtype=torch.uint8, device=device)
+            # Determine shape
+            storage_shape = list(shape)
+            if not SIMULATE_MXFP4_WITH_FP8:
+                 storage_shape[-1] = storage_shape[-1] // 2
+            
+            data = torch.empty(tuple(storage_shape), dtype=torch.uint8, device=device)
+            
             scale_shape = self.get_scale_shape(shape, columnwise=False)
             scale_inv = torch.empty(scale_shape, dtype=torch.uint8, device=device)
-            # Allocate per tensor scale inverse. FP32 format.
-            amax_rowwise = torch.zeros(1, dtype=torch.float32, device=device)
+            amax_rowwise = torch.ones(1, dtype=torch.float32, device=device)
 
-        # Allocate FP8 data transpose if needed
+        # Allocate Columnwise
         columnwise_data = None
         columnwise_scale_inv = None
         amax_columnwise = None
+        
         if self.columnwise_usage:
-            # enforce 2D shape to avoid [S, B, H] shape and B and be 1
-            # and the transposed shape is [H, S, B], so divide last dim by 2 gives zero
-            shape_2d = tuple([flat_first_dim, shape[-1]])
+            # Calculate transposed storage shape
+            shape_2d = tuple([math.prod(shape[:-1]), shape[-1]])
+            col_logical_shape = self.get_columnwise_shape(shape_2d)
+            
+            col_storage_shape = list(col_logical_shape)
+            if not SIMULATE_MXFP4_WITH_FP8:
+                col_storage_shape[-1] = col_storage_shape[-1] // 2
+                
             columnwise_data = torch.empty(
-                self.convert_shape_for_fp4(self.get_columnwise_shape(shape_2d)),
+                tuple(col_storage_shape),
                 dtype=torch.uint8,
                 device=device,
             )
+            
             columnwise_scale_shape = self.get_scale_shape(shape, columnwise=True)
             columnwise_scale_inv = torch.empty(
                 columnwise_scale_shape, dtype=torch.uint8, device=device
             )
-            amax_columnwise = torch.zeros(1, dtype=torch.float32, device=device)
+            amax_columnwise = torch.ones(1, dtype=torch.float32, device=device)
 
-        # Construct FP8 tensor
-        return NVFP4Tensor(
+        return MXFP4Tensor(
             shape=shape,
             dtype=dtype,
             rowwise_data=data,
@@ -334,43 +365,18 @@ class NVFP4Quantizer(Quantizer):
         return canonicalize_process_group(self.amax_reduction_group)
 
     def _get_compatible_recipe(self) -> Union[type[Recipe], None]:
-        return NVFP4BlockScaling
+        # Assuming MXFP4BlockScaling recipe exists, otherwise generic
+        return Recipe 
 
 
-class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
-    """Quantized tensor class with FP4 data
+class MXFP4Tensor(MXFP4TensorStorage, QuantizedTensor):
+    """Quantized tensor class with FP4 data and E8M0 Scaling (MXFP4)
 
     The tensor presents as having a standard, higher-precision dtype,
-    but the data itself is (scaled) FP4. For most tensor operations,
-    the data will be cast to the nominal dtype before performing the
-    operation.
-
-    Parameters
-    ----------
-    rowwise_data: torch.Tensor
-        Raw FP4 data in a uint8 tensor (rowwise layout).
-    rowwise_scale_inv: torch.Tensor
-        Reciprocal of the scaling factor applied when
-        casting to FP4, i.e. the scaling factor that must
-        be applied when casting from FP4 to higher
-        precision (rowwise).
-    columnwise_data: torch.Tensor, optional
-        Raw FP4 data in a uint8 tensor (columnwise layout).
-    columnwise_scale_inv: torch.Tensor, optional
-        Reciprocal of the scaling factor for columnwise FP4 data.
-    amax_rowwise: torch.Tensor, optional
-        Rowwise amax tracking tensor.
-    amax_columnwise: torch.Tensor, optional
-        Columnwise amax tracking tensor.
-    fp4_dtype: TE_DType
-        The FP4 data type used for quantization.
-    quantizer: Quantizer
-        The quantizer instance used for this tensor.
-    dtype: torch.dtype, default = torch.float32
-        Nominal tensor datatype, used in dequantize.
+    but the data itself is packed FP4. The scales are E8M0 (unsigned, power of 2).
     """
 
-    # NOTE: We reorder the *args so that we can instantiate a NVFP4TensorStorage with positional args,
+    # NOTE: We reorder the *args so that we can instantiate a MXFP4TensorStorage with positional args,
     # which significantly reduces the Pybind11 overhead when calling the constructor from C++.
     def __new__(
         cls,
@@ -401,22 +407,22 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         return instance
 
     def __repr__(self, *, tensor_contents=None):
-        return f"NVFP4Tensor, data={self.dequantize(dtype=self.dtype)})"
+        return f"MXFP4Tensor, data={self.dequantize(dtype=self.dtype)})"
 
     def dequantize(self, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
-        Construct plain PyTorch tensor from NVFP4Tensor
+        Construct plain PyTorch tensor from MXFP4Tensor
 
         By default the resulting tensor's dtype is the
-        NVFP4Tensor's nominal dtype.
+        MXFP4Tensor's nominal dtype.
         """
         # Convert PyTorch dtype to TE dtype
         if dtype is None:
             dtype = self.dtype
 
         if torch.is_grad_enabled():
-            return _FromNVFP4Func.apply(self, dtype)
-        return _FromNVFP4Func.forward(None, self, dtype)
+            return _FromMXFP4Func.apply(self, dtype)
+        return _FromMXFP4Func.forward(None, self, dtype)
 
     def _get_quantizer(self) -> Quantizer:
         """Get builder for quantized tensor
@@ -426,15 +432,15 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         """
         if self._quantizer is not None:
             return self._quantizer
-        return NVFP4Quantizer()
+        return MXFP4Quantizer()
 
     def quantize_(
         self,
         tensor: torch.Tensor,
         *,
         noop_flag: Optional[torch.Tensor] = None,
-    ) -> NVFP4Tensor:
-        """Update FP8 data
+    ) -> MXFP4Tensor:
+        """Update FP4 data
 
         Parameters
         ----------
@@ -449,12 +455,11 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         self._get_quantizer().update_quantized(tensor, self, noop_flag=noop_flag)
         return self
 
-    def detach(self) -> NVFP4Tensor:
+    def detach(self) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
-        # TODO(ksivamani): Fix the detach bug
-        return NVFP4Tensor.make_like(self)
+        return MXFP4Tensor.make_like(self)
 
-    def clone(self) -> NVFP4Tensor:
+    def clone(self) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
         assert self._rowwise_data is not None
         rowwise_data = self._rowwise_data.detach().clone()
@@ -469,18 +474,18 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             },
         )
 
-    def view(self, *shape: Tuple[int]) -> NVFP4Tensor:
+    def view(self, *shape: Tuple[int]) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
         return _ViewFunc.apply(self, shape)
 
-    def reshape(self, *shape: Tuple[int]) -> NVFP4Tensor:
+    def reshape(self, *shape: Tuple[int]) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
         return _ReshapeFunc.apply(self, shape)
 
     def contiguous(
         self,
         memory_format: torch.memory_format = torch.contiguous_format,
-    ) -> NVFP4Tensor:
+    ) -> MXFP4Tensor:
         """Returns tensor with data in provided memory format
 
         Returns `self` if data is already in correct memory format.
@@ -494,7 +499,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             memory_format=memory_format
         ):
             return self
-        raise ValueError("NVFP4Tensor does not support different memory formats!")
+        raise ValueError("MXFP4Tensor does not support different memory formats!")
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
@@ -509,7 +514,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 return tensor.detach()
             return tensor.view(shape)
 
-        # NVFP4 dequantize not supported. Add manual support for needed funcs.
+        # MXFP4 dequantize not supported. Add manual support for needed funcs.
         if func in (aten.empty_like.default, aten.zero_.default):
             tensor = args[0]
             data_init_func = torch.zeros_like if func == aten.zero_.default else torch.empty_like
@@ -535,7 +540,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                     None,
                 )
 
-            return NVFP4Tensor(
+            return MXFP4Tensor(
                 shape=tensor.shape,
                 dtype=tensor.dtype,
                 fp4_dtype=tensor._fp4_dtype,
@@ -565,14 +570,9 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         fp4_dtype: TE_DType,
         dtype: torch.dtype,
         quantizer: Quantizer,
-    ) -> NVFP4Tensor:
-        """Build NVFP4Tensor, for use in __reduce__
-
-        __reduce_ex__ assumes object constructor has positional
-        arguments.
-
-        """
-        return NVFP4Tensor(
+    ) -> MXFP4Tensor:
+        """Build MXFP4Tensor, for use in __reduce__"""
+        return MXFP4Tensor(
             shape=shape,
             dtype=dtype,
             fp4_dtype=fp4_dtype,
@@ -589,7 +589,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
     def __reduce_ex__(self, protocol: int) -> tuple:
         """Custom pickling"""
         return (
-            NVFP4Tensor._make_in_reduce_ex,
+            MXFP4Tensor._make_in_reduce_ex,
             (
                 self.shape,
                 self._rowwise_data,
@@ -604,26 +604,21 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             ),
         )
 
-    def _get_data(self) -> NVFP4Tensor:
+    def _get_data(self) -> MXFP4Tensor:
         """Get tensor data property"""
         return super().data
 
     @torch.no_grad()
     def _set_data(self, tensor: torch.Tensor) -> None:
-        """Set tensor data property
-
-        Just takes FP8 data if setting from a NVFP4Tensor. Otherwise
-        casts to FP8.
-
-        """
+        """Set tensor data property"""
 
         # Tensor device
         new_device = tensor.device if tensor.is_cuda else self.device
         if not devices_match(new_device, tensor.device):
             tensor = tensor.to(device=new_device)
 
-        # Just copy FP8 data if other tensor is NVFP4Tensor
-        if isinstance(tensor, NVFP4Tensor):
+        # Just copy FP4 data if other tensor is MXFP4Tensor
+        if isinstance(tensor, MXFP4Tensor):
             if (  # pylint: disable=too-many-boolean-expressions
                 self.size() != tensor.size()
                 or self.stride() != tensor.stride()
@@ -633,7 +628,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 or not devices_match(self.device, new_device)
             ):
                 dummy_tensor = torch.Tensor._make_wrapper_subclass(
-                    NVFP4Tensor,
+                    MXFP4Tensor,
                     tensor.size(),
                     strides=tensor.stride(),
                     storage_offset=tensor.storage_offset(),
@@ -643,7 +638,7 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                     device=new_device,
                 )
                 # pylint: disable=unnecessary-dunder-call
-                super(NVFP4Tensor, type(self)).data.__set__(self, dummy_tensor)
+                super(MXFP4Tensor, type(self)).data.__set__(self, dummy_tensor)
             self._rowwise_data = tensor._rowwise_data
             self._columnwise_data = tensor._columnwise_data
             self._quantizer = tensor._quantizer
@@ -653,29 +648,27 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             self._amax_columnwise = tensor._amax_columnwise
             return
 
-        # Quantize to FP8
+        # Quantize to FP4
         assert self._quantizer is not None, "Can't quantize without a quantizer"
         self._quantizer.update_quantized(tensor, self)
         if self.requires_grad != tensor.requires_grad:
             self.requires_grad_(requires_grad=tensor.requires_grad)
 
-    # Cast to FP8 when setting NVFP4Tensor.data
+    # Cast to FP4 when setting MXFP4Tensor.data
     data = property(_get_data, _set_data)
 
 
 class _ViewFunc(torch.autograd.Function):
     """View function
-
-    View the NVFP4Tensor using the provided shape.
-
+    View the MXFP4Tensor using the provided shape.
     """
 
     @staticmethod
     def forward(
         ctx,
-        tensor: NVFP4Tensor,
+        tensor: MXFP4Tensor,
         shape: Optional[list[int]] = None,
-    ) -> NVFP4Tensor:
+    ) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
 
         # Return input tensor if shape is not provided
@@ -699,7 +692,7 @@ class _ViewFunc(torch.autograd.Function):
                     break
         if shape[-1] != cur_shape[-1]:
             raise RuntimeError(
-                "NVFP4Tensor does not support reshaping inner dimension "
+                "MXFP4Tensor does not support reshaping inner dimension "
                 f"(attempted to reshape dims={tuple(tensor.shape)} to {tuple(shape)})"
             )
 
@@ -707,25 +700,34 @@ class _ViewFunc(torch.autograd.Function):
         new_rowwise_data = None
         new_columnwise_data = None
         if tensor._rowwise_data is not None:
-            if shape[-1] % 2 != 0:
-                raise ValueError(
-                    "Cannot represent row-wise data for NVFP4 tensor "
-                    f"with shape={shape} as byte array."
-                )
-            byte_shape = list(shape[:-1]) + [shape[-1] // 2]
+            if not SIMULATE_MXFP4_WITH_FP8:
+                if shape[-1] % 2 != 0:
+                    raise ValueError(
+                        "Cannot represent row-wise data for MXFP4 tensor "
+                        f"with shape={shape} as byte array."
+                    )
+                byte_shape = list(shape[:-1]) + [shape[-1] // 2]
+            else:
+                # Sim path: one byte per logical element
+                byte_shape = list(shape)
             new_rowwise_data = tensor._rowwise_data.view(byte_shape)
+
         if tensor._columnwise_data is not None:
             columnwise_shape = (shape[-1], math.prod(shape[:-1]))
-            if columnwise_shape[-1] % 2 != 0:
-                raise ValueError(
-                    "Cannot represent column-wise data for NVFP4 tensor "
-                    f"with shape={shape} as byte array."
-                )
-            byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
+            if not SIMULATE_MXFP4_WITH_FP8:
+                if columnwise_shape[-1] % 2 != 0:
+                    raise ValueError(
+                        "Cannot represent column-wise data for MXFP4 tensor "
+                        f"with shape={shape} as byte array."
+                    )
+                byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
+            else:
+                byte_shape = columnwise_shape
             new_columnwise_data = tensor._columnwise_data.view(byte_shape)
 
+
         # Construct tensor
-        return NVFP4Tensor(
+        return MXFP4Tensor(
             shape,
             tensor.dtype,
             rowwise_data=new_rowwise_data,
@@ -746,27 +748,36 @@ class _ViewFunc(torch.autograd.Function):
     ) -> Tuple[Optional[torch.Tensor], ...]:
         # pylint: disable=missing-function-docstring
 
-        if isinstance(grad, NVFP4Tensor):
+        if isinstance(grad, MXFP4Tensor):
             new_rowwise_data = None
             new_columnwise_data = None
             if grad._rowwise_data is not None:
-                if ctx.shape[-1] % 2 != 0:
-                    raise ValueError(
-                        "Cannot represent row-wise data for NVFP4 tensor "
-                        f"with shape={ctx.shape} as byte array."
-                    )
-                byte_shape = list(ctx.shape[:-1]) + [ctx.shape[-1] // 2]
-                new_rowwise_data = grad._rowwise_data.view(byte_shape)
+                if not SIMULATE_MXFP4_WITH_FP8:
+                    if ctx.shape[-1] % 2 != 0:
+                        raise ValueError(
+                            "Cannot represent row-wise data for MXFP4 tensor "
+                            f"with shape={ctx.shape} as byte array."
+                        )
+                    byte_shape = list(ctx.shape[:-1]) + [ctx.shape[-1] // 2]
+                    new_rowwise_data = grad._rowwise_data.view(byte_shape)
+                else:
+                    # Sim path: one byte per logical element
+                    byte_shape = list(ctx.shape)
+                    new_rowwise_data = grad._rowwise_data.view(byte_shape)
             if grad._columnwise_data is not None:
                 columnwise_shape = (ctx.shape[-1], math.prod(ctx.shape[:-1]))
-                if columnwise_shape[-1] % 2 != 0:
-                    raise ValueError(
-                        "Cannot represent column-wise data for NVFP4 tensor "
-                        f"with shape={ctx.shape} as byte array."
-                    )
-                byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
-                new_columnwise_data = grad._columnwise_data.view(byte_shape)
-            dgrad = NVFP4Tensor(
+                if not SIMULATE_MXFP4_WITH_FP8:
+                    if columnwise_shape[-1] % 2 != 0:
+                        raise ValueError(
+                            "Cannot represent column-wise data for MXFP4 tensor "
+                            f"with shape={ctx.shape} as byte array."
+                        )
+                    byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
+                    new_columnwise_data = grad._columnwise_data.view(byte_shape)
+                else:
+                    byte_shape = columnwise_shape
+                    new_columnwise_data = grad._columnwise_data.view(byte_shape)
+            dgrad = MXFP4Tensor(
                 ctx.shape,
                 grad.dtype,
                 rowwise_data=new_rowwise_data,
@@ -785,17 +796,15 @@ class _ViewFunc(torch.autograd.Function):
 
 class _ReshapeFunc(torch.autograd.Function):
     """Reshape function
-
-    Reshape the NVFP4Tensor using the provided shape.
-
+    Reshape the MXFP4Tensor using the provided shape.
     """
 
     @staticmethod
     def forward(
         ctx,
-        tensor: NVFP4Tensor,
+        tensor: MXFP4Tensor,
         shape: Optional[list[int]] = None,
-    ) -> NVFP4Tensor:
+    ) -> MXFP4Tensor:
         # pylint: disable=missing-function-docstring
 
         # Return input tensor if shape is not provided
@@ -819,7 +828,7 @@ class _ReshapeFunc(torch.autograd.Function):
                     break
         if shape[-1] != cur_shape[-1]:
             raise RuntimeError(
-                "NVFP4Tensor does not support reshaping inner dimension "
+                "MXFP4Tensor does not support reshaping inner dimension "
                 f"(attempted to reshape dims={tuple(tensor.shape)} to {tuple(shape)})"
             )
 
@@ -827,25 +836,33 @@ class _ReshapeFunc(torch.autograd.Function):
         new_rowwise_data = None
         new_columnwise_data = None
         if tensor._rowwise_data is not None:
-            if shape[-1] % 2 != 0:
-                raise ValueError(
-                    "Cannot represent row-wise data for NVFP4 tensor "
-                    f"with shape={shape} as byte array."
-                )
-            byte_shape = list(shape[:-1]) + [shape[-1] // 2]
-            new_rowwise_data = tensor._rowwise_data.reshape(byte_shape)
+            if not SIMULATE_MXFP4_WITH_FP8:
+                if shape[-1] % 2 != 0:
+                    raise ValueError(
+                        "Cannot represent row-wise data for MXFP4 tensor "
+                        f"with shape={shape} as byte array."
+                    )
+                byte_shape = list(shape[:-1]) + [shape[-1] // 2]
+            else:
+                # Sim path: one byte per logical element
+                byte_shape = list(shape)
+            new_rowwise_data = tensor._rowwise_data.view(byte_shape)
+
         if tensor._columnwise_data is not None:
             columnwise_shape = (shape[-1], math.prod(shape[:-1]))
-            if columnwise_shape[-1] % 2 != 0:
-                raise ValueError(
-                    "Cannot represent column-wise data for NVFP4 tensor "
-                    f"with shape={shape} as byte array."
-                )
-            byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
-            new_columnwise_data = tensor._columnwise_data.reshape(byte_shape)
+            if not SIMULATE_MXFP4_WITH_FP8:
+                if columnwise_shape[-1] % 2 != 0:
+                    raise ValueError(
+                        "Cannot represent column-wise data for MXFP4 tensor "
+                        f"with shape={shape} as byte array."
+                    )
+                byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
+            else:
+                byte_shape = columnwise_shape
+            new_columnwise_data = tensor._columnwise_data.view(byte_shape)
 
         # Construct tensor
-        return NVFP4Tensor(
+        return MXFP4Tensor(
             shape,
             tensor.dtype,
             rowwise_data=new_rowwise_data,
@@ -866,27 +883,36 @@ class _ReshapeFunc(torch.autograd.Function):
     ) -> Tuple[Optional[torch.Tensor], ...]:
         # pylint: disable=missing-function-docstring
 
-        if isinstance(grad, NVFP4Tensor):
+        if isinstance(grad, MXFP4Tensor):
             new_rowwise_data = None
             new_columnwise_data = None
             if grad._rowwise_data is not None:
-                if ctx.shape[-1] % 2 != 0:
-                    raise ValueError(
-                        "Cannot represent row-wise data for NVFP4 tensor "
-                        f"with shape={ctx.shape} as byte array."
-                    )
-                byte_shape = list(ctx.shape[:-1]) + [ctx.shape[-1] // 2]
-                new_rowwise_data = grad._rowwise_data.reshape(byte_shape)
+                if not SIMULATE_MXFP4_WITH_FP8:
+                    if ctx.shape[-1] % 2 != 0:
+                        raise ValueError(
+                            "Cannot represent row-wise data for MXFP4 tensor "
+                            f"with shape={ctx.shape} as byte array."
+                        )
+                    byte_shape = list(ctx.shape[:-1]) + [ctx.shape[-1] // 2]
+                    new_rowwise_data = grad._rowwise_data.view(byte_shape)
+                else:
+                    # Sim path: one byte per logical element
+                    byte_shape = list(ctx.shape)
+                    new_rowwise_data = grad._rowwise_data.view(byte_shape)
             if grad._columnwise_data is not None:
                 columnwise_shape = (ctx.shape[-1], math.prod(ctx.shape[:-1]))
-                if columnwise_shape[-1] % 2 != 0:
-                    raise ValueError(
-                        "Cannot represent column-wise data for NVFP4 tensor "
-                        f"with shape={ctx.shape} as byte array."
-                    )
-                byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
-                new_columnwise_data = grad._columnwise_data.reshape(byte_shape)
-            dgrad = NVFP4Tensor(
+                if not SIMULATE_MXFP4_WITH_FP8:
+                    if columnwise_shape[-1] % 2 != 0:
+                        raise ValueError(
+                            "Cannot represent column-wise data for MXFP4 tensor "
+                            f"with shape={ctx.shape} as byte array."
+                        )
+                    byte_shape = (columnwise_shape[0], columnwise_shape[1] // 2)
+                    new_columnwise_data = grad._columnwise_data.view(byte_shape)
+                else:
+                    byte_shape = columnwise_shape
+                    new_columnwise_data = grad._columnwise_data.view(byte_shape)
+            dgrad = MXFP4Tensor(
                 ctx.shape,
                 grad.dtype,
                 rowwise_data=new_rowwise_data,

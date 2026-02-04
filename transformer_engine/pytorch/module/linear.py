@@ -133,6 +133,11 @@ class _Linear(torch.autograd.Function):
         # Configure tensor-parallel communication
         tp_world_size = get_distributed_world_size(tp_group)
         backward_needs_input = is_grad_enabled and weight.requires_grad
+        
+        # Save name for debug
+        if hasattr(module, 'name'):
+             ctx.name = module.name
+        
         with_input_all_gather_nccl = (
             parallel_mode == "column" and sequence_parallel and not ub_overlap_ag_fprop
         )
@@ -484,7 +489,7 @@ class _Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         # pylint: disable=missing-function-docstring
-
+        import debugpy; debugpy.breakpoint()
         # NVTX label for profiling
         nvtx_label = "transformer_engine._Linear.backward"
         if ctx.ub_name is not None:
@@ -681,8 +686,8 @@ class _Linear(torch.autograd.Function):
                     grad_output.update_usage(rowwise_usage=True)
                 if ctx.weight_quantizer is not None and isinstance(
                     weight_fp8, QuantizedTensorStorage
-                ):
-                    weight_fp8.update_usage(columnwise_usage=True)
+                ):  
+                    weight_fp8.update_usage(columnwise_usage=True) #TODO: makes it pass the stupid thing, but swizzling breaks - what's going on? 
 
                 # Choose whether to use GEMM kernel with split accumulator
                 use_split_accumulator = _2X_ACC_DGRAD
@@ -707,6 +712,15 @@ class _Linear(torch.autograd.Function):
 
                 # dgrad GEMM
                 # Note: dx = dy * w
+                # print(weight_fp8._columnwise_scale_inv.shape)
+                # print(weight_fp8._rowwise_scale_inv.shape)
+                # print(grad_output._columnwise_scale_inv.shape)
+                # print(grad_output._rowwise_scale_inv.shape)
+                # right before general_gemm in dgrad
+                # print("weight_fp8 logical shape:", tuple(weight_fp8.shape))
+                # print("has rowwise data:", getattr(weight_fp8, "_rowwise_data", None) is not None and getattr(weight_fp8, "_rowwise_data").numel() > 0)
+                # print("rowwise data shape:", None if getattr(weight_fp8, "_rowwise_data", None) is None else tuple(weight_fp8._rowwise_data.shape))
+                # print("columnwise data shape:", None if getattr(weight_fp8, "_columnwise_data", None) is None else tuple(weight_fp8._columnwise_data.shape))
 
                 nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
                 gemm_out, *_, reduce_scatter_out = general_gemm(
@@ -1344,6 +1358,8 @@ class Linear(TransformerEngineBaseModule):
             self._customize_quantizers_float8_blockwise_scaling(fwd, recipe)
         elif recipe.nvfp4():
             self._customize_quantizers_nvfp4(fwd, recipe)
+        elif recipe.mxfp4():
+            self._customize_quantizers_mxfp4(fwd, recipe)
         # elif for other recipes (mxfp8, etc.)
 
     def reset_parameters(self, defer_init=False):
@@ -1675,6 +1691,30 @@ class Linear(TransformerEngineBaseModule):
     def _customize_quantizers_nvfp4(self, fwd: bool, recipe: Recipe) -> None:
         """Customize quantizers based on current scaling recipe + linear."""
         assert recipe.nvfp4(), "Incorrect recipe."
+        if fwd:
+            if self.sequence_parallel and self.parallel_mode == "column":
+                # customize input_quantizer with amax reduction TP group
+                self.quantizers["scaling_fwd"][
+                    tex.FP8FwdTensors.GEMM1_INPUT
+                ].with_amax_reduction = True
+                self.quantizers["scaling_fwd"][
+                    tex.FP8FwdTensors.GEMM1_INPUT
+                ].amax_reduction_group = self.tp_group
+        else:
+            if self.sequence_parallel and self.parallel_mode == "row":
+                # customize grad_output_quantizer with amax reduction TP group
+                self.quantizers["scaling_bwd"][
+                    tex.FP8BwdTensors.GRAD_OUTPUT1
+                ].with_amax_reduction = True
+                self.quantizers["scaling_bwd"][
+                    tex.FP8BwdTensors.GRAD_OUTPUT1
+                ].amax_reduction_group = self.tp_group
+                
+    def _customize_quantizers_mxfp4(self, fwd: bool, recipe: Recipe) -> None:
+        """Customize quantizers for MXFP4."""
+        # We must replace the generic Quantizer objects with MXFP4Quantizer instances
+        # because MXFP4 requires specific C++ binding calls (quantize_impl override).
+        assert recipe.mxfp4(), "Incorrect recipe."
         if fwd:
             if self.sequence_parallel and self.parallel_mode == "column":
                 # customize input_quantizer with amax reduction TP group

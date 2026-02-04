@@ -92,6 +92,7 @@ enum NVTEScalingMode {
   /*! Single scale per block of 16 elements consecutive in either
    * rowwise or columnwise direction */
   NVTE_NVFP4_1D_SCALING = 4,
+  NVTE_MXFP4_1D_SCALING = 5,
   NVTE_INVALID_SCALING = 100
 };
 
@@ -336,6 +337,11 @@ enum NVTEQuantizationConfigAttribute {
   kNVTEQuantizationConfigNVFP42DQuantization = 5,
   /*! Whether to enable stochastic rounding */
   kNVTEQuantizationConfigStochasticRounding = 6,
+
+  kNVTEQuantizationConfigGlobalScaling = 7,
+
+  kNVTEQuantizationConfigEncodeCentric = 8,
+
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -879,6 +885,17 @@ class QuantizationConfigWrapper {
     nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigStochasticRounding,
                                            &stochastic_rounding, sizeof(bool));
   }
+
+  void set_global_scaling(bool global_scaling) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigGlobalScaling,
+                                           &global_scaling, sizeof(bool));
+  }
+
+  void set_encode_centric(bool encode_centric) {
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigEncodeCentric,
+                                           &encode_centric, sizeof(bool));
+  }
+
 
  private:
   /*! \brief Wrapped NVTEQuantizationConfig. */

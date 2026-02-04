@@ -69,6 +69,11 @@ std::vector<py::object> bgrad_quantize(const at::Tensor &grad_output, py::handle
   } else if (detail::IsMXFP8Quantizers(quantizer.ptr())) {
     // Fused kernel for dbias + MXFP8 quantize
     with_fused_kernel = true;
+  } else if (detail::IsMXFP4Quantizers(quantizer.ptr())) {
+    // [MXFP4 Support]
+    // MXFP4 does not support fused dbias kernel yet.
+    // Force unfused path: Compute bias grad in HP -> Quantize grad input explicitly.
+    with_fused_kernel = false;
   }
 
   // Apply unfused impl if fused kernel is not supported
@@ -158,6 +163,10 @@ std::vector<py::object> dact_dbias(
     } else {
       impl = Impl::FUSED_DACT_AMAX_NVFP4;
     }
+  } else if (detail::IsMXFP4Quantizers(quantizer_py.ptr())) {
+    // [MXFP4 Support]
+    // Default to Unfused for MXFP4 backward.
+    impl = Impl::UNFUSED;
   }
 
   // Perform compute

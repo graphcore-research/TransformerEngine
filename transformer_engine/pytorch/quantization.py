@@ -24,6 +24,7 @@ from transformer_engine.common.recipe import (
     Float8CurrentScaling,
     Float8BlockScaling,
     NVFP4BlockScaling,
+    MXFP4BlockScaling,  # <--- Added Import
     CustomRecipe,
 )
 
@@ -37,6 +38,7 @@ __all__ = [
     "quantized_model_init",
     "is_fp8_available",
     "is_mxfp8_available",
+    "is_mxfp4_available", # <--- Added to __all__
     "is_fp8_block_scaling_available",
     "is_nvfp4_available",
     "get_default_recipe",
@@ -76,6 +78,15 @@ def check_nvfp4_support() -> Tuple[bool, str]:
 
 
 @functools.lru_cache(maxsize=None)
+def check_mxfp4_support() -> Tuple[bool, str]:
+    """Return if mxfp4 support is available"""
+    # MXFP4 requires Blackwell (10.0) or higher
+    if get_device_compute_capability() >= (10, 0):
+        return True, ""
+    return False, "Device compute capability 10.0 or higher required for MXFP4 execution."
+
+
+@functools.lru_cache(maxsize=None)
 def check_fp8_block_scaling_support() -> Tuple[bool, str]:
     """Return if fp8 block scaling support is available"""
     if get_device_compute_capability() >= (9, 0) and float(torch.version.cuda) >= 12.9:
@@ -96,6 +107,11 @@ def check_recipe_support(recipe: Recipe) -> None:
         recipe_supported, unsupported_reason = check_fp8_block_scaling_support()
     elif isinstance(recipe, MXFP8BlockScaling):
         recipe_supported, unsupported_reason = check_mxfp8_support()
+    elif isinstance(recipe, MXFP4BlockScaling):  # <--- Added Check
+        recipe_supported, unsupported_reason = check_mxfp4_support()
+    elif isinstance(recipe, NVFP4BlockScaling):
+        recipe_supported, unsupported_reason = check_nvfp4_support()
+        
     assert recipe_supported, unsupported_reason
 
 
@@ -185,6 +201,24 @@ def is_mxfp8_available(return_reason: bool = False) -> Union[bool, Tuple[bool, s
     return check_mxfp8_support()[0]
 
 
+def is_mxfp4_available(return_reason: bool = False) -> Union[bool, Tuple[bool, str]]:
+    """
+    Determine if support is available for the MXFP4 recipe.
+
+    Parameters
+    ----------
+    return_reason : bool, optional
+        If ``False`` (default), return only a boolean indicating availability.
+        If ``True``, return a tuple ``(is_available, reason)`` where ``reason`` provides
+        a human-readable explanation when required support is not available. The reason
+        will be an empty string if support for MXFP4 is available.
+
+    """
+    if return_reason:
+        return check_mxfp4_support()
+    return check_mxfp4_support()[0]
+
+
 def is_fp8_block_scaling_available(return_reason: bool = False) -> Union[bool, Tuple[bool, str]]:
     """
     Determine if support is available for the FP8 block scaling recipe.
@@ -249,6 +283,8 @@ class FP8GlobalStateManager:
     reason_for_no_fp8_block_scaling = None
     nvfp4_available = None
     reason_for_no_nvfp4 = ""
+    mxfp4_available = None  # <--- Added
+    reason_for_no_mxfp4 = ""  # <--- Added
 
     @classmethod
     def reset(cls) -> None:
@@ -274,6 +310,8 @@ class FP8GlobalStateManager:
         cls.reason_for_no_mxfp8 = ""
         cls.fp8_block_scaling_available = None
         cls.reason_for_no_fp8_block_scaling = ""
+        cls.mxfp4_available = None # <--- Added
+        cls.reason_for_no_mxfp4 = "" # <--- Added
 
     @classmethod
     def set_skip_fp8_weight_update_tensor(cls, skip: bool) -> None:
@@ -306,6 +344,11 @@ class FP8GlobalStateManager:
     def is_nvfp4_available(cls) -> Tuple[bool, str]:
         """Return if NVFP4 support is available."""
         return check_nvfp4_support()
+        
+    @classmethod
+    def is_mxfp4_available(cls) -> Tuple[bool, str]:  # <--- Added
+        """Return if MXFP4 support is available."""
+        return check_mxfp4_support()
 
     @staticmethod
     def get_meta_tensor_key(forward: bool = True) -> str:
@@ -586,6 +629,9 @@ class FP8GlobalStateManager:
             if isinstance(fp8_recipe, NVFP4BlockScaling):
                 nvfp4_available, reason_for_no_nvfp4 = cls.is_nvfp4_available()
                 assert nvfp4_available, reason_for_no_nvfp4
+            if isinstance(fp8_recipe, MXFP4BlockScaling): # <--- Added Assertion
+                mxfp4_available, reason_for_no_mxfp4 = cls.is_mxfp4_available()
+                assert mxfp4_available, reason_for_no_mxfp4
 
     @classmethod
     def autocast_exit(cls, enabled: bool, _graph: bool) -> None:
@@ -1014,6 +1060,8 @@ class RecipeState(abc.ABC):
             cls = Float8BlockScalingRecipeState
         elif recipe.nvfp4():
             cls = NVFP4BlockScalingRecipeState
+        elif recipe.mxfp4():
+            cls = MXFP4BlockScalingRecipeState
         elif recipe.custom():
             cls = CustomRecipeState
         else:
@@ -1322,6 +1370,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     with_post_rht_amax=qparams.random_hadamard_transform,
                     with_2d_quantization=qparams.fp4_2d_quantization,
                     stochastic_rounding=qparams.stochastic_rounding,
+                    encode_centric=qparams.encode_centric
                 )
 
             return [_make_quantizer(idx) for idx in range(self.num_quantizers)]
@@ -1336,6 +1385,93 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     with_post_rht_amax=self.recipe.fp4_quant_bwd_grad.random_hadamard_transform,
                     with_2d_quantization=self.recipe.fp4_quant_bwd_grad.fp4_2d_quantization,
                     stochastic_rounding=self.recipe.fp4_quant_bwd_grad.stochastic_rounding,
+                    encode_centric=self.recipe.fp4_quant_bwd_grad.encode_centric
+                )
+                for _ in range(self.num_quantizers)
+            ]
+
+        raise RuntimeError(f"Unexpected recipe mode ({self.mode})")
+
+SIMULATE_MXFP4_WITH_FP8 = True
+
+class MXFP4BlockScalingRecipeState(RecipeState):
+    """Configuration for MXFP4 quantization.
+
+    MXFP4 quantization does not require state.
+    """
+
+    recipe: MXFP4BlockScaling
+    mode: str
+    dtype: tex.DType
+
+    def __init__(
+        self,
+        recipe: MXFP4BlockScaling,
+        *,
+        mode: str,
+        num_quantizers: int = 1,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.recipe = recipe
+        self.mode = mode
+        self.num_quantizers = num_quantizers
+        self.dtype = tex.DType.kFloat8E4M3 if SIMULATE_MXFP4_WITH_FP8  else  get_fp4_te_dtype(recipe)
+
+        # Allocate buffers
+        if device is None:
+            device = torch.device("cuda")
+
+    def make_quantizers(self) -> list:
+        from .tensor.mxfp4_tensor import MXFP4Quantizer
+
+        # MXFP4 typically relies on standard block scaling (e.g. block size 32).
+        # We assume the MXFP4Quantizer defaults handle strict MXFP4 compliance,
+        # but allow recipe overrides if provided in the recipe object.
+
+        if self.mode == "forward":
+
+            def _make_quantizer(idx: int) -> MXFP4Quantizer:
+                # Map inputs/weights using the standard triplets logic
+                qparams = (
+                    self.recipe.fp4_quant_fwd_weight
+                    if idx % 3 == 1
+                    else self.recipe.fp4_quant_fwd_inp
+                )
+                
+                # Check for attributes that might exist on MXFP4 recipe params, 
+                # falling back to defaults if the recipe object is simple.
+                stochastic_rounding = getattr(qparams, "stochastic_rounding", False)
+                with_rht = getattr(qparams, "random_hadamard_transform", False)
+                stochastic_rounding = getattr(qparams, "stochastic_rounding", False)
+                global_scaling = getattr(qparams, "global_scaling", False)
+                encode_centric = getattr(qparams, "encode_centric", False)
+
+                return MXFP4Quantizer(
+                    fp4_dtype=self.dtype,
+                    rowwise=True,
+                    columnwise=True,
+                    # MXFP4 generally assumes specific block sizes (e.g. 32),
+                    # handled internally by the quantizer or via defaults.
+                    stochastic_rounding=stochastic_rounding,
+                    with_rht=with_rht,
+                    with_post_rht_amax=with_rht and global_scaling,
+                    global_scaling = global_scaling,
+                    encode_centric=encode_centric
+                )
+
+            return [_make_quantizer(idx) for idx in range(self.num_quantizers)]
+
+        if self.mode == "backward":
+            return [
+                MXFP4Quantizer(
+                    fp4_dtype=self.dtype,
+                    rowwise=True,
+                    columnwise=True,
+                    stochastic_rounding=getattr(self.recipe.fp4_quant_bwd_grad, "stochastic_rounding", False),
+                    with_rht=getattr(self.recipe.fp4_quant_bwd_grad, "random_hadamard_transform", False),
+                    with_post_rht_amax=getattr(self.recipe.fp4_quant_bwd_grad, "random_hadamard_transform", False),
+                    global_scaling = getattr(self.recipe.fp4_quant_bwd_grad, "global_scaling", False),
+                    encode_centric=getattr(self.recipe.fp4_quant_bwd_grad, "encode_centric", False)
                 )
                 for _ in range(self.num_quantizers)
             ]

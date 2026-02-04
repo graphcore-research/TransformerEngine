@@ -82,6 +82,8 @@ from transformer_engine.pytorch.tensor import Float8Tensor
 from transformer_engine.pytorch.tensor import MXFP8Tensor
 from transformer_engine.pytorch.tensor import Float8BlockwiseQTensor
 from transformer_engine.pytorch.tensor import NVFP4Tensor
+from transformer_engine.pytorch.tensor import MXFP4Tensor
+from transformer_engine.pytorch.tensor import MXFP4Quantizer
 from transformer_engine.pytorch.tensor import prepare_for_saving
 from transformer_engine.pytorch.tensor import restore_from_saved
 

@@ -48,6 +48,12 @@ py::object activation_helper(const at::Tensor& input, py::handle quantizer, int 
     } else {
       impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
     }
+  } else if (detail::IsMXFP4Quantizers(quantizer.ptr())) {
+    // [MXFP4 Support]
+    // MXFP4 block scaling happens during the quantization step.
+    // Standard TE activations do not support direct fused output to MXFP4 yet.
+    // We compute in High Precision -> Quantize explicitly.
+    impl = Impl::UNFUSED;
   }
 
   // Perform compute
@@ -160,6 +166,10 @@ py::object dactivation_helper(const at::Tensor& grad_output, const at::Tensor& i
     } else {
       impl = Impl::FUSED_ACTIVATION_AMAX_NVFP4;
     }
+  } else if (detail::IsMXFP4Quantizers(quantizer.ptr())) {
+    // [MXFP4 Support]
+    // Default to Unfused for MXFP4 backward as well.
+    impl = Impl::UNFUSED;
   }
 
   // Perform compute

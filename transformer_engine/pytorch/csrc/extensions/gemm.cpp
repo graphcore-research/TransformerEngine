@@ -18,6 +18,11 @@
 #include "transformer_engine/transformer_engine.h"
 #include "util.h"
 
+// [MXFP4 FIX] Ensure simulation flag is defined
+#ifndef MXFP4_SIMULATE_WITH_FP8
+#define MXFP4_SIMULATE_WITH_FP8 1
+#endif
+
 namespace {
 
 void* get_data_ptr(transformer_engine::pytorch::MaybeTensor tensor) {
@@ -28,6 +33,33 @@ void* get_data_ptr(transformer_engine::pytorch::MaybeTensor tensor) {
 size_t get_size(transformer_engine::pytorch::MaybeTensor tensor, int dim) {
   if (tensor.has_value()) return static_cast<size_t>(tensor->size(dim));
   return 0;
+}
+
+// [DEBUG] Helper to inspect AMAX pointers and values
+void debug_print_amax(const char* label, transformer_engine::TensorWrapper& t) {
+    auto row_amax = t.get_amax();
+    auto col_amax = t.get_columnwise_amax();
+    // fprintf(stderr, "[DEBUG GEMM %s] RowAmax Ptr: %p, ColAmax Ptr: %p\n", label, row_amax.data_ptr, col_amax.data_ptr);
+    
+    // Try to read Row AMAX
+    if (row_amax.data_ptr) {
+        float val;
+        cudaError_t err = cudaMemcpy(&val, row_amax.data_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+        if (err == cudaSuccess) fprintf(stderr, "    -> Row Val: %f\n", val);
+        else fprintf(stderr, "    -> Row Val: READ FAIL (%d)\n", err);
+    } else {
+        fprintf(stderr, "    -> Row Val: NULLPTR\n");
+    }
+
+    // Try to read Col AMAX
+    if (col_amax.data_ptr) {
+        float val;
+        cudaError_t err = cudaMemcpy(&val, col_amax.data_ptr, sizeof(float), cudaMemcpyDeviceToHost);
+        if (err == cudaSuccess) fprintf(stderr, "    -> Col Val: %f\n", val);
+        else fprintf(stderr, "    -> Col Val: READ FAIL (%d)\n", err);
+    } else {
+        fprintf(stderr, "    -> Col Val: NULLPTR\n");
+    }
 }
 
 }  // namespace
@@ -94,13 +126,19 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
                              std::optional<CommOverlapType> comm_type, MaybeTensor extra_output,
                              bool bulk_overlap, float alpha, std::optional<float> beta) {
   using namespace transformer_engine::pytorch::detail;
-
+  // fprintf(stderr, "IN THE MF GEMM\n");
+  
   // Input tensors
   NVTE_CHECK(!A.is_none(), "Tensor A has not been provided");
   NVTE_CHECK(!B.is_none(), "Tensor B has not been provided");
   auto none = py::none();
   TensorWrapper A_tensor = makeTransformerEngineTensor(A, none);
   TensorWrapper B_tensor = makeTransformerEngineTensor(B, none);
+
+  // [DEBUG] 1. Right after assignment
+  // fprintf(stderr, "\n=== [DEBUG] 1. After Tensor Creation ===\n");
+  // debug_print_amax("A", A_tensor);
+  // debug_print_amax("B", B_tensor);
 
   const bool low_precision =
       detail::is_low_precision(A_tensor.dtype()) || detail::is_low_precision(B_tensor.dtype());
@@ -112,6 +150,17 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
   // Check tensor dimensions
   const auto& A_shape = A_tensor.shape();
   const auto& B_shape = B_tensor.shape();
+
+  // auto print_shape = [](const char* name, const NVTEShape& s) {
+  //     fprintf(stderr, "DEBUG GEMM: %s shape (ndim=%lu): [", name, s.ndim);
+  //     for (size_t i = 0; i < s.ndim; ++i) fprintf(stderr, "%lu ", s.data[i]);
+  //     fprintf(stderr, "]\n");
+  // };
+
+  // fprintf(stderr, "DEBUG GEMM INPUTS:\n");
+  // fprintf(stderr, "  transa=%d, transb=%d\n", int(transa), int(transb));
+  // print_shape("A", A_shape);
+  // print_shape("B", B_shape);
   const auto& D_shape = detail::getGemmOutputShape(A_shape, transa, B_shape, transb);
   NVTE_CHECK(A_shape.ndim >= 1, "Tensor A needs to have at least 1 dimension");
   NVTE_CHECK(B_shape.ndim >= 1, "Tensor B needs to have at least 1 dimension");
@@ -234,10 +283,16 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
   std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
   auto main_stream = at::cuda::getCurrentCUDAStream();
   if (A_tensor.numel() != 0 && B_tensor.numel() != 0) {
+    // fprintf(stderr, "TIME TO SWIZZEL BRAH\n");
     // Optionally swizzle the scaling factors
     swizzled_scale_inverses_list.emplace_back(std::move(swizzle_scaling_factors(A_tensor, transa)));
     swizzled_scale_inverses_list.emplace_back(
         std::move(swizzle_scaling_factors(B_tensor, !transb)));
+
+    // [DEBUG] 2. After Swizzle
+    // fprintf(stderr, "\n=== [DEBUG] 2. After Swizzle ===\n");
+    // debug_print_amax("A", A_tensor);
+    // debug_print_amax("B", B_tensor);
 
     // Emulate the FP8 block scaling recipe with MXFP8 on Blackwell and newer
     // as it is not natively supported by cublasLt
@@ -304,6 +359,11 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
         }
       }
     } else {
+      // [DEBUG] 3. Before Kernel
+      // fprintf(stderr, "\n=== [DEBUG] 3. Before Kernel Launch ===\n");
+      // debug_print_amax("A", A_tensor);
+      // debug_print_amax("B", B_tensor);
+
       // Launch GEMM
       NVTE_SCOPED_GIL_RELEASE({
         nvte_cublas_gemm_v2(transa, transb, &alpha, A_tensor.data(), B_tensor.data(), &beta.value(),

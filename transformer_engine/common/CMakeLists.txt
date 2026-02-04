@@ -196,6 +196,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      activation/swiglu.cu
      transpose/quantize_transpose_square_blockwise.cu
      transpose/quantize_transpose_vector_blockwise_fp4.cu
+     transpose/quantize_transpose_vector_blockwise_mxfp4.cu
      hadamard_transform/hadamard_transform.cu
      hadamard_transform/hadamard_transform_cast_fusion.cu)
 

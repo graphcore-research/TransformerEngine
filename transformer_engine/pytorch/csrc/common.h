@@ -296,7 +296,7 @@ class NVFP4Quantizer : public Quantizer {
   // 2D block scaling
   bool with_2d_quantization;
   bool stochastic_rounding;
-
+  bool encode_centric;
   int rht_matrix_random_sign_mask_t;
   at::Tensor rht_matrix;
 
@@ -335,6 +335,49 @@ class NVFP4Quantizer : public Quantizer {
  private:
   void quantize_impl(const TensorWrapper& input, TensorWrapper& out,
                      const std::optional<TensorWrapper>& noop_flag, bool compute_amax);
+};
+
+class MXFP4Quantizer : public Quantizer {
+ public:
+  MXFP4Quantizer(const py::handle& quantizer);
+
+  void set_quantization_params(TensorWrapper* tensor) const override;
+
+  // ADD THIS LINE:
+  NVTEScalingMode get_scaling_mode() const override; 
+
+  std::pair<TensorWrapper, py::object> create_tensor(
+      const std::vector<size_t>& shape, DType dtype) const override;
+
+  std::pair<TensorWrapper, py::object> convert_and_update_tensor(
+      py::object tensor) const override;
+
+  void quantize(const TensorWrapper& input, TensorWrapper& out,
+                const std::optional<TensorWrapper>& noop_flag) override;
+
+  void quantize_with_amax(TensorWrapper& input, TensorWrapper& out);
+
+  static std::pair<TensorWrapper, py::object> create_unquantized_tensor_with_amax(
+      TensorWrapper& quantized_tensor, DType dtype);
+
+ private:
+  // ... (keep private members as they were) ...
+  void quantize_impl(const TensorWrapper& input, TensorWrapper& out,
+                     const std::optional<TensorWrapper>& noop_flag, bool compute_amax);
+
+  std::vector<size_t> get_scale_shape(const std::vector<size_t>& shape, bool columnwise) const;
+
+  DType dtype;
+  bool with_rht;
+  bool with_post_rht_amax;
+  bool with_2d_quantization;
+  bool stochastic_rounding;
+  bool global_scaling;
+  bool encode_centric;
+  bool with_amax_reduction;
+  c10::intrusive_ptr<dist_group_type> amax_reduction_group;
+  int rht_matrix_random_sign_mask_t;
+  at::Tensor rht_matrix;
 };
 
 std::unique_ptr<Quantizer> convert_quantizer(py::handle quantizer);

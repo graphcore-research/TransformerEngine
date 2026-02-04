@@ -83,6 +83,8 @@ def experimental_gemm(
             sx,
             sw,
             bias,
+            accumulate=accumulate,
+            out=out,
             gemm_type=GEMMType.FPROP,
             qresult_x=A,
             qresult_w=B,
@@ -108,6 +110,8 @@ def experimental_gemm(
             sdy,
             sw_t,
             None,
+            accumulate=accumulate,
+            out=out,
             gemm_type=GEMMType.DGRAD,
             qresult_x=A,
             qresult_w=B,
@@ -128,10 +132,18 @@ def experimental_gemm(
             sdy_t,
             sx_t,
             None,
+            accumulate=accumulate,
+            out=out,
             gemm_type=GEMMType.WGRAD,
             qresult_x=A,
             qresult_w=B,
         )
 
     # Return in the same format as general_gemm
-    return result, None, None, None
+    bias_grad = None
+    if gemm_type == GEMMType.WGRAD and bias is not None:
+        # A contains dy in WGRAD path (after swap)
+        # We need to dequantize and sum over batch/seq dims
+        bias_grad = A.dequantize().view(-1, A.original_shape[-1]).sum(0)
+
+    return result, bias_grad, None, None

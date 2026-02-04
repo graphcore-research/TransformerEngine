@@ -36,6 +36,11 @@ PyTypeObject *NVFP4TensorPythonClass = nullptr;
 PyTypeObject *NVFP4TensorStoragePythonClass = nullptr;
 PyTypeObject *NVFP4QuantizerClass = nullptr;
 
+// [FIX 1] Pointers are defined here (this was already in your code)
+PyTypeObject *MXFP4TensorPythonClass = nullptr;
+PyTypeObject *MXFP4TensorStoragePythonClass = nullptr;
+PyTypeObject *MXFP4QuantizerClass = nullptr;
+
 void init_float8_extension() {
   if (Float8TensorPythonClass) return;
   auto fp8_module = py::module_::import("transformer_engine.pytorch.tensor.float8_tensor");
@@ -66,6 +71,28 @@ void init_mxfp8_extension() {
       PyObject_GetAttrString(fp8_base_module.ptr(), "MXFP8TensorStorage"));
   NVTE_CHECK(MXFP8TensorPythonClass != nullptr,
              "Internal error: could not initialize pyTorch MXFP8 extension.");
+}
+
+// [FIX 2] New function to initialize MXFP4 pointers
+void init_mxfp4_extension() {
+  if (MXFP4TensorPythonClass) return;
+  
+  // NOTE: Adjust these string paths if your python files are named differently
+  // e.g. "mxfp4_tensor" vs "mx_fp4_tensor"
+  auto mxfp4_module = py::module_::import("transformer_engine.pytorch.tensor.mxfp4_tensor");
+  
+  MXFP4QuantizerClass =
+      reinterpret_cast<PyTypeObject *>(PyObject_GetAttrString(mxfp4_module.ptr(), "MXFP4Quantizer"));
+  MXFP4TensorPythonClass =
+      reinterpret_cast<PyTypeObject *>(PyObject_GetAttrString(mxfp4_module.ptr(), "MXFP4Tensor"));
+      
+  auto mxfp4_base_module =
+      py::module_::import("transformer_engine.pytorch.tensor.storage.mxfp4_tensor_storage");
+  MXFP4TensorStoragePythonClass = reinterpret_cast<PyTypeObject *>(
+      PyObject_GetAttrString(mxfp4_base_module.ptr(), "MXFP4TensorStorage"));
+      
+  NVTE_CHECK(MXFP4TensorPythonClass != nullptr,
+             "Internal error: could not initialize pyTorch MXFP4 extension. Check python file paths.");
 }
 
 void init_float8blockwise_extension() {
@@ -109,6 +136,8 @@ void init_extension() {
   init_mxfp8_extension();
   init_float8blockwise_extension();
   init_nvfp4_extensions();
+  // [FIX 3] Call the new init function
+  init_mxfp4_extension(); 
 }
 
 }  // namespace transformer_engine::pytorch

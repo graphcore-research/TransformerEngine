@@ -139,11 +139,11 @@ void compute_amax_impl(const NVTETensor input_, const NVTETensor output_, cudaSt
   NVTE_CHECK(output_ != nullptr, "Invalid output tensor (got NULL)");
   auto &output = *convertNVTETensorCheck(output_);
   NVTE_CHECK(output.scaling_mode == NVTE_DELAYED_TENSOR_SCALING ||
-                 output.scaling_mode == NVTE_NVFP4_1D_SCALING,
-             "Output tensor for amax computation must be FP8 tensor with per-tensor scaling or "
-             "NVFP4 1D scaling, "
-             "but got scaling_mode=",
-             to_string(output.scaling_mode));
+           output.scaling_mode == NVTE_NVFP4_1D_SCALING ||
+           output.scaling_mode == NVTE_MXFP4_1D_SCALING, // <--- ADD THIS
+           "Output tensor for amax computation must be FP8 tensor with per-tensor scaling, "
+           "NVFP4 1D scaling, or MXFP4 1D scaling, but got scaling_mode=", 
+           static_cast<int>(output.scaling_mode));
   NVTE_CHECK(output.amax.numel() == 1,
              "Output tensor for amax computation has invalid amax tensor "
              "(expected 1 entry, got shape=",
