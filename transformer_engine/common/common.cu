@@ -39,12 +39,16 @@ cudaDataType_t get_cuda_dtype(const transformer_engine::DType t) {
       return CUDA_R_8F_E4M3;
     case DType::kFloat8E5M2:
       return CUDA_R_8F_E5M2;
+    case DType::kByte:
+      return CUDA_R_8U;
+    case DType::kFloat8E8M0:
+      return CUDA_R_8U;  // Treat E8M0 as uint8 for storage
 #if CUDA_VERSION >= 12080
     case DType::kFloat4E2M1:
       return CUDA_R_4F_E2M1;
 #endif
     default:
-      NVTE_ERROR("Invalid type");
+      NVTE_ERROR("Invalid type: ", to_string(t));
   }
 }
 
@@ -210,8 +214,13 @@ CUtensorMapDataType get_CUtensorMapDataType(DType dtype) {
     typeMapping.insert(
         {DType::kFloat4E2M1, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B});
 #endif
+    // MXFP4: Add E8M0 support
+    typeMapping.insert({DType::kFloat8E8M0, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8});
     return typeMapping;
   }();
+  if (dtypeMapping.find(dtype) == dtypeMapping.end()) {
+    NVTE_ERROR("Unsupported data type for TMA: ", to_string(dtype));
+  }
   return dtypeMapping.at(dtype);
 }
 

@@ -47,6 +47,7 @@ from transformer_engine.pytorch.quantization import is_fp8_available
 from transformer_engine.pytorch.quantization import is_mxfp8_available
 from transformer_engine.pytorch.quantization import is_fp8_block_scaling_available
 from transformer_engine.pytorch.quantization import is_nvfp4_available
+from transformer_engine.pytorch.quantization import is_mxfp4_available
 from transformer_engine.pytorch.quantization import get_default_recipe
 from transformer_engine.pytorch.utils import get_cudnn_version
 from transformer_engine.pytorch.utils import get_device_compute_capability
@@ -78,14 +79,17 @@ from transformer_engine.pytorch.tensor import Float8CurrentScalingQuantizer
 from transformer_engine.pytorch.tensor import MXFP8Quantizer
 from transformer_engine.pytorch.tensor import Float8BlockQuantizer
 from transformer_engine.pytorch.tensor import NVFP4Quantizer
+from transformer_engine.pytorch.tensor import MXFP4Quantizer
 from transformer_engine.pytorch.tensor import Float8TensorStorage
 from transformer_engine.pytorch.tensor import MXFP8TensorStorage
 from transformer_engine.pytorch.tensor import Float8BlockwiseQTensorStorage
 from transformer_engine.pytorch.tensor import NVFP4TensorStorage
+from transformer_engine.pytorch.tensor import MXFP4TensorStorage
 from transformer_engine.pytorch.tensor import Float8Tensor
 from transformer_engine.pytorch.tensor import MXFP8Tensor
 from transformer_engine.pytorch.tensor import Float8BlockwiseQTensor
 from transformer_engine.pytorch.tensor import NVFP4Tensor
+from transformer_engine.pytorch.tensor import MXFP4Tensor
 
 try:
     torch._dynamo.config.error_on_nested_jit_trace = False

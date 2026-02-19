@@ -39,6 +39,7 @@ __all__ = [
     "is_mxfp8_available",
     "is_fp8_block_scaling_available",
     "is_nvfp4_available",
+    "is_mxfp4_available",
     "get_default_recipe",
     "get_align_size_for_quantization",
 ]
@@ -47,6 +48,7 @@ __all__ = [
 _FP8_SUPPORT: Optional[Tuple[bool, str]] = None
 _MXFP8_SUPPORT: Optional[Tuple[bool, str]] = None
 _NVFP4_SUPPORT: Optional[Tuple[bool, str]] = None
+_MXFP4_SUPPORT: Optional[Tuple[bool, str]] = None
 _FP8_BLOCK_SCALING_SUPPORT: Optional[Tuple[bool, str]] = None
 
 
@@ -77,6 +79,13 @@ def _compute_nvfp4_support() -> Tuple[bool, str]:
     if get_device_compute_capability() >= (10, 0):  # blackwell and above
         return True, ""
     return False, "Device compute capability 10.0 or higher required for NVFP4 execution."
+
+
+def _compute_mxfp4_support() -> Tuple[bool, str]:
+    """Return if mxfp4 support is available"""
+    if get_device_compute_capability() >= (10, 0):  # blackwell and above
+        return True, ""
+    return False, "Device compute capability 10.0 or higher required for MXFP4 execution."
 
 
 def _compute_fp8_block_scaling_support() -> Tuple[bool, str]:
@@ -117,6 +126,15 @@ def check_nvfp4_support() -> Tuple[bool, str]:
 
 
 @torch.compiler.assume_constant_result
+def check_mxfp4_support() -> Tuple[bool, str]:
+    """Return if MXFP4 support is available."""
+    global _MXFP4_SUPPORT
+    if _MXFP4_SUPPORT is None:
+        _MXFP4_SUPPORT = _compute_mxfp4_support()
+    return _MXFP4_SUPPORT
+
+
+@torch.compiler.assume_constant_result
 def check_fp8_block_scaling_support() -> Tuple[bool, str]:
     """Return if fp8 block scaling support is available."""
     global _FP8_BLOCK_SCALING_SUPPORT
@@ -139,6 +157,8 @@ def check_recipe_support(recipe: Recipe) -> None:
         recipe_supported, unsupported_reason = check_fp8_block_scaling_support()
     elif isinstance(recipe, MXFP8BlockScaling):
         recipe_supported, unsupported_reason = check_mxfp8_support()
+    elif isinstance(recipe, NVFP4BlockScaling):
+        recipe_supported, unsupported_reason = check_nvfp4_support()
     if not recipe_supported:
         raise RuntimeError(unsupported_reason)
 
@@ -306,6 +326,24 @@ class FP8GlobalState:
     skip_fp8_weight_update_tensor: Optional[torch.Tensor] = None
 
 
+def is_mxfp4_available(return_reason: bool = False) -> Union[bool, Tuple[bool, str]]:
+    """
+    Determine if support is available for the MXFP4 recipe.
+
+    Parameters
+    ----------
+    return_reason : bool, optional
+        If ``False`` (default), return only a boolean indicating availability.
+        If ``True``, return a tuple ``(is_available, reason)`` where ``reason`` provides
+        a human-readable explanation when required support is not available. The reason
+        will be an empty string if support for MXFP4 is available.
+
+    """
+    if return_reason:
+        return check_mxfp4_support()
+    return check_mxfp4_support()[0]
+
+
 class FP8GlobalStateManager:
     """Class to keep track of and manipulate the global
     FP8 state at different stages of execution.
@@ -337,6 +375,11 @@ class FP8GlobalStateManager:
     def is_nvfp4_available(cls) -> Tuple[bool, str]:
         """Return if NVFP4 support is available."""
         return check_nvfp4_support()
+
+    @classmethod
+    def is_mxfp4_available(cls) -> Tuple[bool, str]:
+        """Return if MXFP4 support is available."""
+        return check_mxfp4_support()
 
     @staticmethod
     def get_meta_tensor_key(forward: bool = True) -> str:

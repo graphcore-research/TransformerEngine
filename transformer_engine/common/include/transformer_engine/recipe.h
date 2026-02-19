@@ -309,6 +309,23 @@ void nvte_nvfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_r
                                          const NVTETensor inpB, const bool use_rowwise_amax_B,
                                          float alpha_in, NVTETensor alpha_out, cudaStream_t stream);
 
+/*! \brief Compute per-tensor scaling factor for MXFP4 format.
+ *
+ *  This function computes the scaling factor (alpha) for MXFP4 quantization based
+ *  on the input tensors A and B, using only FP4 max (6.0) without FP8 second-stage scaling.
+ *
+ *  \param[in]     inpA                Input tensor A.
+ *  \param[in]     use_rowwise_amax_A  Whether to use row-wise amax for tensor A.
+ *  \param[in]     inpB                Input tensor B.
+ *  \param[in]     use_rowwise_amax_B  Whether to use row-wise amax for tensor B.
+ *  \param[in]     alpha_in            Input scaling factor.
+ *  \param[out]    alpha_out           Output scaling factor.
+ *  \param[in]     stream              CUDA stream used for the operation.
+ */
+void nvte_mxfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_rowwise_amax_A,
+                                         const NVTETensor inpB, const bool use_rowwise_amax_B,
+                                         float alpha_in, NVTETensor alpha_out, cudaStream_t stream);
+
 /*! \brief Compute tile-level amax for a partial shard of a 2D tensor.
  *
  *  For NVFP4 2D quantization with 16x16 tiles. Computes the maximum absolute

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 
@@ -97,16 +97,13 @@ def get_nvfp4_quantizer_factory(with_rht: bool = False, with_2d_quantization: bo
         elif role == "linear_output":
             # Output quantization not used
             return None
-        elif role == "linear_grad_output":
+        elif role in ("linear_grad_output", "linear_grad", "linear_grad_input"):
             return quantization_nvfp4.NVFP4QuantizerRef(
                 dtype=utils.Fp4Formats.E2M1,
                 quant_tile_shape=(1, 16),
                 pow_2_scales=False,
                 with_rht=with_rht,
             )
-        elif role == "linear_grad_input":
-            # Grad input quantization not used
-            return None
         else:
             # For any other roles, return None
             return None
@@ -337,8 +334,7 @@ def check_nvfp4_module_versus_reference(
         (1024, 4096),
     ],
 )
-# @pytest.mark.parametrize("bias", [True, False], ids=["with_bias", "no_bias"])
-@pytest.mark.parametrize("bias", [False], ids=["no_bias"])
+@pytest.mark.parametrize("bias", [True, False], ids=["with_bias", "no_bias"])
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=str)
 @pytest.mark.parametrize("num_steps", [1, 3], ids=["single_step", "multi_step"])
 @pytest.mark.parametrize("with_rht", [True, False], ids=["with_rht", "no_rht"])
@@ -460,7 +456,7 @@ def check_nvfp4_layernorm_linear_versus_reference(
 
         # Reference forward/backward
         with te.autocast(enabled=True, recipe=nvfp4_ref_recipe):
-            y_ref, ln_out_ref = ref_module(x_ref)
+            y_ref, ln_out_ref = ref_module(x_ref, is_first_microbatch=(step == 0))
         y_ref.backward(grad_output)
 
         native_outputs.append(
@@ -552,7 +548,7 @@ def check_nvfp4_layernorm_linear_versus_reference(
 )
 @pytest.mark.parametrize("bias", [False], ids=["no_bias"])
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=str)
-@pytest.mark.parametrize("num_steps", [1], ids=["single_step"])
+@pytest.mark.parametrize("num_steps", [1, 3], ids=["single_step", "multi_step"])
 @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"], ids=["LayerNorm", "RMSNorm"])
 @pytest.mark.parametrize("with_rht", [True, False], ids=["with_rht", "no_rht"])
 @pytest.mark.parametrize(

@@ -114,7 +114,14 @@ def _get_shared_object_file(library: str) -> Path:
         so_prefix = f"transformer_engine_{library}"
 
     # Search for shared lib in imported directory
-    te_path = Path(importlib.util.find_spec("transformer_engine").origin).parent.parent
+    _spec = importlib.util.find_spec("transformer_engine")
+    if _spec is not None and _spec.origin is not None:
+        te_path = Path(_spec.origin).parent.parent
+    elif _spec is not None and _spec.submodule_search_locations:
+        te_path = Path(list(_spec.submodule_search_locations)[0]).parent
+    else:
+        import transformer_engine as _te_mod
+        te_path = Path(_te_mod.__path__[0]).parent
     so_path = _find_shared_object_in_te_dir(te_path, so_prefix)
     if so_path is not None:
         return so_path

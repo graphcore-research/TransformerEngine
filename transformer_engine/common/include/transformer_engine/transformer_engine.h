@@ -97,6 +97,8 @@ enum NVTEScalingMode {
   /*! Single scale per block of 16 elements consecutive in either
    * rowwise or columnwise direction */
   NVTE_NVFP4_1D_SCALING = 4,
+  /*! Single scale per block of 32 elements for MXFP4 format */
+  NVTE_MXFP4_1D_SCALING = 5,
   NVTE_INVALID_SCALING = 100
 };
 

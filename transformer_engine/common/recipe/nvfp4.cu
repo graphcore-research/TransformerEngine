@@ -954,3 +954,47 @@ void nvte_nvfp4_fused_scale(const NVTETensor block_amax, const NVTETensor global
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
 #endif  // FP4_TYPE_SUPPORTED
 }
+
+namespace transformer_engine {
+namespace mxfp4_recipe {
+
+// MXFP4: FP4-only factor, no FP8=448 term
+// (We keep the 6 * 6 because each input is clipped to ±6.)
+constexpr float factor_mxfp4 = 1.0 / (6.0 * 6.0);
+// Kernel to compute alpha_out = alpha_in * amax_A * amax_B / (6 * 6)
+__global__ void compute_mxfp4_per_tensor_scale_kernel(float alpha_in,
+                                                      const float *amax_A,
+                                                      const float *amax_B,
+                                                      float *alpha_out) {
+  *alpha_out = alpha_in * (*amax_A) * (*amax_B) * factor_mxfp4;
+}
+
+}  // namespace mxfp4_recipe
+}  // namespace transformer_engine
+
+void nvte_mxfp4_compute_per_tensor_scale(const NVTETensor inpA, const bool use_rowwise_amax_A,
+                                         const NVTETensor inpB, const bool use_rowwise_amax_B,
+                                         float alpha_in, NVTETensor alpha_out,
+                                         cudaStream_t stream) {
+  NVTE_API_CALL(nvte_mxfp4_compute_per_tensor_scale);
+  using namespace transformer_engine;
+
+  auto *tA   = convertNVTETensor(inpA);
+  auto *tB   = convertNVTETensor(inpB);
+  auto *tOut = convertNVTETensor(alpha_out);
+
+  void *amax_A_ptr = use_rowwise_amax_A ? tA->amax.dptr : tA->columnwise_amax.dptr;
+  void *amax_B_ptr = use_rowwise_amax_B ? tB->amax.dptr : tB->columnwise_amax.dptr;
+  void *alpha_ptr  = tOut->data.dptr;
+
+  NVTE_CHECK(amax_A_ptr != nullptr, "amax_A_ptr is null");
+  NVTE_CHECK(amax_B_ptr != nullptr, "amax_B_ptr is null");
+  NVTE_CHECK(alpha_ptr  != nullptr, "alpha_ptr is null");
+
+  mxfp4_recipe::compute_mxfp4_per_tensor_scale_kernel<<<1, 1, 0, stream>>>(
+      alpha_in,
+      reinterpret_cast<const float *>(amax_A_ptr),
+      reinterpret_cast<const float *>(amax_B_ptr),
+      reinterpret_cast<float *>(alpha_ptr));
+  NVTE_CHECK_CUDA(cudaGetLastError());
+}

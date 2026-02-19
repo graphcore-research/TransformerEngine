@@ -25,6 +25,10 @@
 #include "./config.h"
 #include "./cutlass_grouped_gemm.cuh"
 
+#ifndef MXFP4_SIMULATE_WITH_FP8
+#define MXFP4_SIMULATE_WITH_FP8 1
+#endif
+
 namespace {
 
 /* Use CUDA const memory to store scalar 1 and 0 for cublas usage
@@ -117,9 +121,12 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
   bool is_A_transposed = transA == CUBLAS_OP_T;
   bool is_B_transposed = transB == CUBLAS_OP_T;
 
-  // Set conditions for MXFP8 and NVFP4 gemm execution.
+  // Set conditions for MXFP8 and NVFP4/MXFP4 gemm execution.
   const auto nvfp4 = is_nvfp_scaling(A.scaling_mode) && is_nvfp_scaling(B.scaling_mode);
-  const auto mxfp8 = !nvfp4 && is_mxfp_scaling(A.scaling_mode) && is_mxfp_scaling(B.scaling_mode);
+  const auto fp4_block =
+      (is_nvfp_scaling(A.scaling_mode) && is_nvfp_scaling(B.scaling_mode)) ||
+      (is_mxfp4_scaling(A.scaling_mode) && is_mxfp4_scaling(B.scaling_mode));
+  const auto mxfp8 = !nvfp4 && !fp4_block && is_mxfp_scaling(A.scaling_mode) && is_mxfp_scaling(B.scaling_mode);
   int is_nvte_non_tn_fp8_gemm_supported = 0;  // needed only for per tensor scaling
   if (is_tensor_scaling(A.scaling_mode) || is_tensor_scaling(B.scaling_mode)) {
     is_nvte_non_tn_fp8_gemm_supported = nvte_is_non_tn_fp8_gemm_supported();
@@ -161,19 +168,30 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
       NVTE_CHECK(ret.lda % 16 == 0,
                  "Leading dimension requirement on A for FP8 GEMM. Caller must pad.");
     }
-  } else if (nvfp4) {
-    // NVFP4 GEMM. Either the pure NVFP4 recipe or the FWD pass of the Hybrid NVFP4/MXFP8 recipe.
+  } else if (fp4_block) {
+    // FP4 GEMM (NVFP4 or MXFP4: both are FP4 block-scaled along K)
 
     if (is_A_transposed) {
       NVTE_CHECK(A.has_data(), "Input A is missing row-wise usage");
     } else {
-      NVTE_CHECK(is_nvfp4_scaling(A.scaling_mode),
+      NVTE_CHECK(is_fp4_block_scaling(A.scaling_mode),
                  "Input A has unsupported combination of recipe and layout");
       NVTE_CHECK(A.has_columnwise_data(), "Input A is missing column-wise usage");
     }
+    // TN layout only (same as NVFP4)
     ret.A = is_A_transposed ? A.data.dptr : A.columnwise_data.dptr;
-    ret.transA = CUBLAS_OP_T;  // NVFP4 gemm is only supported in TN layout.
-    ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+    ret.transA = CUBLAS_OP_T;
+
+    #if MXFP4_SIMULATE_WITH_FP8
+      if (is_mxfp4_scaling(A.scaling_mode)) {
+        ret.Atype = transformer_engine::DType::kFloat8E4M3;
+      } else {
+        ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+      }
+    #else
+      ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+    #endif
+
     ret.A_scale_inv = is_A_transposed ? A.scale_inv.dptr : A.columnwise_scale_inv.dptr;
     ret.lda = k;
   } else if (mxfp8) {
@@ -252,17 +270,26 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
       NVTE_CHECK(ret.ldb % 16 == 0,
                  "Leading dimension requirement on B for FP8 GEMM. Caller must pad.");
     }
-  } else if (nvfp4) {
+  } else if (fp4_block) {
+    // FP4 GEMM (NVFP4 or MXFP4)
     if (is_B_transposed) {
-      NVTE_CHECK(is_nvfp4_scaling(B.scaling_mode),
+      NVTE_CHECK(is_fp4_block_scaling(B.scaling_mode),
                  "Input B has unsupported combination of recipe and layout");
       NVTE_CHECK(B.has_columnwise_data(), "Input B is missing column-wise usage");
     } else {
       NVTE_CHECK(B.has_data(), "Input B is missing row-wise usage");
     }
     ret.B = is_B_transposed ? B.columnwise_data.dptr : B.data.dptr;
-    ret.transB = CUBLAS_OP_N;  // NVFP4 gemm is only supported in TN layout.
-    ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+    ret.transB = CUBLAS_OP_N;
+    #if MXFP4_SIMULATE_WITH_FP8
+      if (is_mxfp4_scaling(B.scaling_mode)) {
+        ret.Btype = transformer_engine::DType::kFloat8E4M3;
+      } else {
+        ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+      }
+    #else
+      ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+    #endif
     ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
     ret.ldb = k;
   } else if (mxfp8) {
@@ -353,46 +380,69 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
     counter = inputCounter->data.dptr;
   }
   const bool gelu = pre_gelu_out != nullptr;
-  const bool use_fp8 = is_fp8_dtype(param.Atype) || is_fp8_dtype(param.Btype);
-  const bool use_fp4 = is_fp4_dtype(param.Atype) || is_fp4_dtype(param.Btype);
+  const bool is_nvfp4_mode =
+      is_nvfp_scaling(inputA->scaling_mode) || is_nvfp_scaling(inputB->scaling_mode);
+  const bool is_mxfp4_mode =
+      is_mxfp4_scaling(inputA->scaling_mode) || is_mxfp4_scaling(inputB->scaling_mode);
 
-  // Update scaling factors with NVFP4 tensor scales
-  // TODO: Check whether scales are on CPU/GPU or add API to control.
-  // Currently scales are assumed to be on CPU when amax is provided
-  // and on GPU when not provided, but this is brittle.
-  if (use_fp4 &&
-      ((transa == CUBLAS_OP_T ? inputA->amax.dptr : inputA->columnwise_amax.dptr) != nullptr ||
-       (transb == CUBLAS_OP_T ? inputB->columnwise_amax.dptr : inputB->amax.dptr) != nullptr)) {
-    // Reserve some workspace for alpha scale
+  const bool use_fp4 = is_fp4_dtype(param.Atype) || is_fp4_dtype(param.Btype);
+  const bool use_fp8 = is_fp8_dtype(param.Atype) || is_fp8_dtype(param.Btype);
+
+  #if MXFP4_SIMULATE_WITH_FP8
+  // MXFP4 simulation: logical MXFP4 scaling, physical FP8 data
+  const bool is_mxfp4_sim =
+      is_mxfp4_mode && use_fp8;  // FP8 dtype + MXFP4 scaling
+  #else
+  const bool is_mxfp4_sim = false;
+  #endif
+
+  // NVFP4 and MXFP4 both use FP4-style per-tensor alpha; MXFP4 may choose
+  // to disable it by omitting amax (global-scale ablation).
+  const bool uses_fp4_like_scaling = is_nvfp4_mode || is_mxfp4_mode;
+
+  if (uses_fp4_like_scaling) {
+    // Reserve some workspace for alpha (device scalar)
     NVTE_CHECK(workspaceSize >= 4,
-               "NVFP4 GEMM requires at least 4 byte workspace for alpha scale, but only has ",
+               "FP4 GEMM requires at least 4 byte workspace for alpha scale, but only has ",
                workspaceSize, " bytes remaining.");
     workspaceSize = (workspaceSize / 4) * 4 - 4;  // Remove last 4 aligned bytes
     uint8_t *workspace_ptr = reinterpret_cast<uint8_t *>(workspace);
     float *new_alpha_ptr = reinterpret_cast<float *>(&workspace_ptr[workspaceSize]);
 
-    // Update alpha scale on device
-    // Note: Compute NVFP4 tensor scales based on amaxes and then
-    // divide from alpha scale. This way we only need to apply NVFP4
-    // tensor scales in matmul output, instead of in matmul inputs.
-    float old_alpha = *reinterpret_cast<const float *>(alpha);  // Assumed to be on CPU
+    float old_alpha = *reinterpret_cast<const float *>(alpha);  // host value
     TensorWrapper new_alpha_tensor(new_alpha_ptr, std::vector<size_t>{1}, DType::kFloat32);
     bool a_rowwise_amax = transa == CUBLAS_OP_T;
     bool b_rowwise_amax = transb != CUBLAS_OP_T;
-    nvte_nvfp4_compute_per_tensor_scale(inputA->nvte_tensor, a_rowwise_amax, inputB->nvte_tensor,
-                                        b_rowwise_amax, old_alpha, new_alpha_tensor.data(), stream);
+
+    if (is_nvfp4_mode) {
+      // Original NVFP4 behavior
+      nvte_nvfp4_compute_per_tensor_scale(
+          inputA->nvte_tensor, a_rowwise_amax,
+          inputB->nvte_tensor, b_rowwise_amax,
+          old_alpha, new_alpha_tensor.data(), stream);
+    } else if (is_mxfp4_mode) {
+      // MXFP4 behavior (with global per-tensor scaling)
+      nvte_mxfp4_compute_per_tensor_scale(
+          inputA->nvte_tensor, a_rowwise_amax,
+          inputB->nvte_tensor, b_rowwise_amax,
+          old_alpha, new_alpha_tensor.data(), stream);
+    } else {
+      // Unknown FP4 scaling mode: keep alpha unchanged so behavior is sane.
+      set_float_kernel<<<1, 1, 0, stream>>>(new_alpha_ptr, old_alpha);
+      NVTE_CHECK_CUDA(cudaGetLastError());
+    }
+
     alpha = new_alpha_ptr;
 
-    // Make sure beta scale is on device
-    float old_beta = *reinterpret_cast<const float *>(beta);  // Assumed to be on CPU
-    if (old_beta == 0) {
-      beta = GetScalarZero();  // Device constant memory
-    } else if (old_beta == 1) {
-      beta = GetScalarOne();  // Device constant memory
+    // Make sure beta is also on device (since we'll use DEVICE pointer mode for FP4)
+    float old_beta = *reinterpret_cast<const float *>(beta);  // host value
+    if (old_beta == 0.f) {
+      beta = GetScalarZero();   // device const
+    } else if (old_beta == 1.f) {
+      beta = GetScalarOne();    // device const
     } else {
-      // Move beta to workspace
       NVTE_CHECK(workspaceSize >= 4,
-                 "NVFP4 GEMM requires at least 4 byte workspace for beta scale, but only has ",
+                 "FP4 GEMM requires at least 4 byte workspace for beta scale, but only has ",
                  workspaceSize, " bytes remaining.");
       workspaceSize = (workspaceSize / 4) * 4 - 4;  // Remove last 4 aligned bytes
       float *new_beta_ptr = reinterpret_cast<float *>(&workspace_ptr[workspaceSize]);
@@ -470,7 +520,8 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
   // set fp8/fp4 attributes -- input and output types should already be set to fp8/fp4
   // as appropriate. Note: gelu fusion isn't available right now, and we don't need
   // amax(D) either (next op is high precision).
-  const bool mxfp8_gemm = !use_fp4 && is_mxfp8_scaling(inputA->scaling_mode);
+  const bool mxfp8_gemm =
+    !use_fp4 && (is_mxfp_scaling(inputA->scaling_mode) || is_mxfp4_sim);
 
   if (use_fp8 || use_fp4) {
     // Fast accumulation is only supported for FP8.
@@ -532,17 +583,11 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       NVTE_ERROR("MXFP8 requires cuBLAS 12.8+, but compile-time cuBLAS version is ",
                  CUBLAS_VERSION);
 #endif                     // CUBLAS_VERSION >= 120800
-    } else if (use_fp4) {  // NVFP4 GEMM
+    } else if (use_fp4) {
 #if CUBLAS_VERSION >= 120800
       NVTE_CHECK(transformer_engine::cuda::cublas_version() >= 120800,
                  "FP4 requires cuBLAS 12.8+, but run-time cuBLAS version is ",
                  transformer_engine::cuda::cublas_version());
-
-      // Check that scales are in expected format
-      NVTE_CHECK(inputA->with_gemm_swizzled_scales,
-                 "NVFP4 block scales are not in format expected by GEMM");
-      NVTE_CHECK(inputB->with_gemm_swizzled_scales,
-                 "NVFP4 block scales are not in format expected by GEMM");
 
       // alpha and beta are device pointers to FP32
       const cublasDataType_t scale_type = CUDA_R_32F;
@@ -552,17 +597,41 @@ void cublas_gemm(const Tensor *inputA, const Tensor *inputB, Tensor *outputD,
       NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(
           operationDesc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointer_mode, sizeof(pointer_mode)));
 
-      // Configure cuBLAS scales
-      fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(param.A_scale_inv);
-      fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(param.B_scale_inv);
-      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
-                                                       CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                                                       &A_scale_inverse, sizeof(A_scale_inverse)));
-      NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
-                                                       CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                                                       &B_scale_inverse, sizeof(B_scale_inverse)));
-      scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-      scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+      if (is_mxfp4_mode) {
+        // MXFP4: per-32 FP4s, UE8M0 exponents (E8M0)
+        fp8e8m0 *A_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.A_scale_inv);
+        fp8e8m0 *B_scale_inverse = reinterpret_cast<fp8e8m0 *>(param.B_scale_inv);
+        NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                         CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                                         &A_scale_inverse, sizeof(A_scale_inverse)));
+        NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                         CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                                         &B_scale_inverse, sizeof(B_scale_inverse)));
+        scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+        scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
+      } else if (is_nvfp4_mode) {
+        // NVFP4: per-16 FP4s, UE4M3 scales
+        // Check that scales are in expected format
+        NVTE_CHECK(inputA->with_gemm_swizzled_scales,
+                   "NVFP4 block scales are not in format expected by GEMM");
+        NVTE_CHECK(inputB->with_gemm_swizzled_scales,
+                   "NVFP4 block scales are not in format expected by GEMM");
+
+        fp8e4m3 *A_scale_inverse = reinterpret_cast<fp8e4m3 *>(param.A_scale_inv);
+        fp8e4m3 *B_scale_inverse = reinterpret_cast<fp8e4m3 *>(param.B_scale_inv);
+        NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                         CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                                         &A_scale_inverse, sizeof(A_scale_inverse)));
+        NVTE_CHECK_CUBLAS(cublasLtMatmulDescSetAttribute(operationDesc,
+                                                         CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                                         &B_scale_inverse, sizeof(B_scale_inverse)));
+        scaling_mode_a = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        scaling_mode_b = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+      } else {
+        NVTE_ERROR("FP4 scaling mode must be NVFP4 or MXFP4, got ",
+                   to_string(inputA->scaling_mode), " and ",
+                   to_string(inputB->scaling_mode));
+      }
 #else
       NVTE_ERROR("FP4 requires cuBLAS 12.8+, but compile-time cuBLAS version is ", CUBLAS_VERSION);
 #endif  // CUBLAS_VERSION >= 120800

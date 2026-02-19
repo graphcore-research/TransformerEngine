@@ -85,11 +85,17 @@ inline bool is_delayed_tensor_scaling(const NVTEScalingMode &mode) {
 
 inline bool is_nvfp4_scaling(const NVTEScalingMode &mode) { return mode == NVTE_NVFP4_1D_SCALING; }
 
+inline bool is_mxfp4_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP4_1D_SCALING; }
+
 inline bool is_mxfp8_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP8_1D_SCALING; }
 
 inline bool is_mxfp_scaling(const NVTEScalingMode &mode) { return mode == NVTE_MXFP8_1D_SCALING; }
 
 inline bool is_nvfp_scaling(const NVTEScalingMode &mode) { return mode == NVTE_NVFP4_1D_SCALING; }
+
+inline bool is_fp4_block_scaling(NVTEScalingMode mode) {
+  return is_nvfp_scaling(mode) || is_mxfp4_scaling(mode);
+}
 
 inline size_t product(const std::vector<size_t> &shape, const size_t begin, const size_t end) {
   NVTE_CHECK(begin <= end && end <= shape.size(), "Attempted to access entries ", begin, " to ",
@@ -255,7 +261,8 @@ struct Tensor {
       case NVTE_DELAYED_TENSOR_SCALING:
       case NVTE_BLOCK_SCALING_1D:
       case NVTE_BLOCK_SCALING_2D:
-      case NVTE_NVFP4_1D_SCALING: {
+      case NVTE_NVFP4_1D_SCALING:
+      case NVTE_MXFP4_1D_SCALING: {
         // Row-wise data shape matches tensor logical shape,
         // column-wise data shape is transpose of logical shape
         if (!has_data() && has_columnwise_data()) {
@@ -470,6 +477,8 @@ struct QuantizationConfig {
   bool nvfp4_2d_quantization = false;
   bool stochastic_rounding = false;
   bool use_fast_math = false;
+  bool global_scaling = false;
+  bool encode_centric = false;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(uint8_t),                       // force_pow_2_scales
@@ -479,7 +488,9 @@ struct QuantizationConfig {
       sizeof(NVTETensor),                    // rng_seed and offset
       sizeof(uint8_t),                       // nvfp4_2d_quantization
       sizeof(uint8_t),                       // stochastic_rounding
-      sizeof(uint8_t)                        // use_fast_math
+      sizeof(uint8_t),                       // use_fast_math
+      sizeof(uint8_t),                       // global_scaling
+      sizeof(uint8_t)                        // encode_centric
   };
 };
 
