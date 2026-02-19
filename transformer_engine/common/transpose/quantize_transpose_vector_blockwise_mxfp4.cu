@@ -19,7 +19,7 @@
 #include "common/transpose/cast_transpose.h"
 #include "common/util/ptx.cuh"
 #include "common/utils.cuh"
-#include "curanddx.hpp"
+#include "common/util/curanddx.hpp"
 
 // Turn this on/off to match your build configuration
 #ifndef MXFP4_SIMULATE_WITH_FP8
@@ -59,8 +59,7 @@ using std::uint8_t;
 
 using transformer_engine::detail::TypeExtrema;
 
-using RNG = decltype(curanddx::Generator<curanddx::philox4_32>() + curanddx::PhiloxRounds<10>() +
-                     curanddx::SM<800>() + curanddx::Thread());
+using RNG = transformer_engine::curanddx::detail::philox4x32_native_state<10>;
 
 constexpr int kThreadsPerWarp = 32;
 
@@ -191,8 +190,7 @@ __device__ __forceinline__ float groupMax(float val, unsigned int groupMask) {
 __device__ __forceinline__ uint32_t get_rbits(RNG& rng, uint4& random_uint4, int& rnd_idx) {
   if (rnd_idx == 4) {
     rnd_idx = 0;
-    curanddx::uniform_bits dist;
-    random_uint4 = dist.generate4(rng);
+    random_uint4 = rng.generate4();
   }
   const uint32_t* const rbits_arr = reinterpret_cast<uint32_t*>(&random_uint4);
   const uint32_t rbits = rbits_arr[rnd_idx++];
@@ -310,9 +308,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock) block_scaled_1d_cast_transpo
       threadIdx.x + block_idx_x * kThreadsPerBlock + block_idx_y * gridDim.x * kThreadsPerBlock;
   const size_t rng_seed = rng_state != nullptr ? rng_state[0] : 0;
   const size_t rng_offset = rng_state != nullptr ? rng_state[1] : 0;
-  RNG rng(rng_seed, rng_sequence, rng_offset);
-  curanddx::uniform_bits dist;
-  uint4 random_uint4 = kApplyStochasticRounding ? dist.generate4(rng) : uint4{0, 0, 0, 0};
+  RNG rng;
+  rng.init(rng_seed, rng_sequence, rng_offset);
+  uint4 random_uint4 = kApplyStochasticRounding ? rng.generate4() : uint4{0, 0, 0, 0};
   int rnd_idx = 0;
 
   extern __shared__ char smem_base[];
