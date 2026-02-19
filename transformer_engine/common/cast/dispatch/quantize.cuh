@@ -50,8 +50,9 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+               output_tensor->scaling_mode == NVTE_MXFP4_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4/MXFP4 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -131,6 +132,30 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
       }
       break;
     }
+    case NVTE_MXFP4_1D_SCALING: {
+      NVTE_CHECK(!IS_ACT, "IS_ACT is not supported by FWD NVTE_MXFP4_1D_SCALING");
+
+      // Check tensors
+      CheckNoopTensor(*noop_tensor, "cast_noop");
+      CheckInputTensor(*input_tensor, "input");
+      CheckOutputTensor(*output_tensor, "output", false);
+
+      auto &global_amax = (output_tensor->amax.dptr != nullptr) ? output_tensor->amax
+                                                                : output_tensor->columnwise_amax;
+      quantize_transpose_vector_blockwise_mxfp4(
+          /*input=*/input_tensor->data, /*global_amax=*/global_amax,
+          /*scale_inv=*/output_tensor->scale_inv,
+          /*scale_inv_t=*/output_tensor->columnwise_scale_inv,
+          /*output=*/output_tensor->data, /*output_t=*/output_tensor->columnwise_data,
+          /*epsilon=*/0.0f, /*return_identity=*/output_tensor->has_data(),
+          /*return_transpose=*/output_tensor->has_columnwise_data(), /*pow2_scale=*/false,
+          /*swizzled_scale=*/false,
+          /*use_stochastic_rounding=*/quant_config_cpp.stochastic_rounding,
+          /*rng_state=*/quant_config_cpp.rng_state,
+          /*use_2d_quantization=*/false,
+          /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
+      break;
+    }
     case NVTE_BLOCK_SCALING_2D: {
       // TODO(kwyss): IS_ACT, ParamOP, OP parameters support.
       NVTE_CHECK(!IS_ACT, "IS_ACT is not implemented for FWD NVTE_BLOCK_SCALING_2D");
@@ -195,8 +220,9 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
 
   // Check for unsupported options
   if (quant_config_cpp.stochastic_rounding) {
-    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING,
-               "Stochastic rounding is only supported for NVFP4 quantization.");
+    NVTE_CHECK(output_tensor->scaling_mode == NVTE_NVFP4_1D_SCALING ||
+               output_tensor->scaling_mode == NVTE_MXFP4_1D_SCALING,
+               "Stochastic rounding is only supported for NVFP4/MXFP4 quantization.");
   }
 
   NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
@@ -268,6 +294,31 @@ void quantize_bwd_helper(const NVTETensor grad, const NVTETensor input, NVTETens
             /*use_2d_quantization=*/quant_config_cpp.nvfp4_2d_quantization,
             /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
       }
+      break;
+    }
+    case NVTE_MXFP4_1D_SCALING: {
+      NVTE_CHECK((!IS_DBIAS && !IS_DACT),
+                 "IS_DBIAS and IS_DACT are not supported by BWD NVTE_MXFP4_1D_SCALING");
+
+      // Check tensors
+      CheckNoopTensor(*noop_tensor, "cast_noop");
+      CheckInputTensor(*grad_tensor, "input");
+      CheckOutputTensor(*output_tensor, "output", false);
+
+      auto &global_amax = (output_tensor->amax.dptr != nullptr) ? output_tensor->amax
+                                                                : output_tensor->columnwise_amax;
+      quantize_transpose_vector_blockwise_mxfp4(
+          /*input=*/grad_tensor->data, /*global_amax=*/global_amax,
+          /*scale_inv=*/output_tensor->scale_inv,
+          /*scale_inv_t=*/output_tensor->columnwise_scale_inv,
+          /*output=*/output_tensor->data, /*output_t=*/output_tensor->columnwise_data,
+          /*epsilon=*/0.0f, /*return_identity=*/output_tensor->has_data(),
+          /*return_transpose=*/output_tensor->has_columnwise_data(), /*pow2_scale=*/false,
+          /*swizzled_scale=*/false,
+          /*use_stochastic_rounding=*/quant_config_cpp.stochastic_rounding,
+          /*rng_state=*/quant_config_cpp.rng_state,
+          /*use_2d_quantization=*/false,
+          /*noop_tensor=*/noop_tensor->data, /*stream=*/stream);
       break;
     }
     case NVTE_BLOCK_SCALING_2D: {

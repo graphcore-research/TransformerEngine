@@ -45,6 +45,8 @@ std::string to_string(const NVTEScalingMode &mode) {
       return "NVTE_BLOCK_SCALING_2D";
     case NVTE_NVFP4_1D_SCALING:
       return "NVTE_NVFP4_1D_SCALING";
+    case NVTE_MXFP4_1D_SCALING:
+      return "NVTE_MXFP4_1D_SCALING";
     case NVTE_INVALID_SCALING:
       return "NVTE_INVALID_SCALING";
   }
@@ -123,7 +125,7 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
                    "\" has invalid columnwise_scale_inv shape (expected ", expected, ", got ",
                    t.columnwise_scale_inv.shape, ")");
       }
-    } else if (t.scaling_mode == NVTE_NVFP4_1D_SCALING) {
+    } else if (t.scaling_mode == NVTE_NVFP4_1D_SCALING || t.scaling_mode == NVTE_MXFP4_1D_SCALING) {
       if (t.has_data()) {
         const size_t expected_y = DIVUP_TO_MULTIPLE(t.flat_first_dim(), 128);
         const size_t expected_x = DIVUP_TO_MULTIPLE(DIVUP(t.flat_last_dim(), 16lu), 4);
@@ -358,8 +360,13 @@ static void CheckGroupedScaleInv(const GroupedTensor &t, const std::string &name
     check_scales(DType::kFloat32);
   } else if (is_mxfp8_scaling(t.scaling_mode)) {
     check_scales(DType::kFloat8E8M0);
-  } else if (is_nvfp4_scaling(t.scaling_mode)) {
-    check_scales(DType::kFloat8E4M3);
+  } else if (is_nvfp4_scaling(t.scaling_mode) || is_mxfp4_scaling(t.scaling_mode)) {
+    // MXFP4 uses E8M0 scales, NVFP4 uses E4M3 scales
+    if (is_mxfp4_scaling(t.scaling_mode)) {
+      check_scales(DType::kFloat8E8M0);
+    } else {
+      check_scales(DType::kFloat8E4M3);
+    }
   } else {
     // Non-quantized types should not have scale/scale_inv
     NVTE_CHECK(!t.scale_inv.has_data(), "Scale_inv not supported for non-quantized ", tensor_type,

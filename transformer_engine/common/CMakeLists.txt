@@ -228,7 +228,8 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      recipe/mxfp8_scaling.cu
      recipe/nvfp4.cu
      transpose/quantize_transpose_square_blockwise.cu
-     transpose/quantize_transpose_vector_blockwise_fp4.cu)
+     transpose/quantize_transpose_vector_blockwise_fp4.cu
+     transpose/quantize_transpose_vector_blockwise_mxfp4.cu)
 
 # Compiling the files with the worst compilation time first to hopefully overlap
 # better with the faster-compiling cpp files
