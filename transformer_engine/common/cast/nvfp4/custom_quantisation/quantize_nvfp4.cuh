@@ -49,15 +49,16 @@ constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM_X;  // 8 = 128
 #define DIRECT_SCALING_FACTORS_STORE 1
 
 template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
-          typename IType, typename OType, bool COLWISE_SCALING, size_t CHUNK_DIM_Y,
-          size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK>
+          typename IType, typename OType, bool COLWISE_SCALING, bool ENCODE_CENTRIC,
+          size_t CHUNK_DIM_Y, size_t CHUNK_DIM_X, size_t THREADS_PER_CHUNK>
 __global__ void __launch_bounds__(THREADS_PER_CHUNK)
     quantize_nvfp4_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                           const __grid_constant__ CUtensorMap tensor_map_output_rowwise,
                           const __grid_constant__ CUtensorMap tensor_map_output_colwise,
                           fp8e4m3 *const scales_rowwise_e4m3, e8m0_t *const scales_colwise_e8m0,
                           const float *noop, float *const amax_ptr,
-                          const float *const nvfp4_second_stage_scale_ptr, const size_t rows,
+                          const float *const amax_rowwise_ptr,
+                          const float *const amax_colwise_ptr, const size_t rows,
                           const size_t cols, const size_t scale_stride_rowwise,
                           const size_t scale_stride_colwise) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -167,9 +168,11 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 
   const bool is_master_thread = (threadIdx.x == 0);
 
-  // Compute a global encoding/decoding scaling factor for all S_dec_b
+  // Compute global encoding/decoding scaling factors (matching v29 nvfp4_transpose.cuh)
   const float S_enc =
-      (nvfp4_second_stage_scale_ptr == nullptr) ? 1.0f : 1.0f / (*nvfp4_second_stage_scale_ptr);
+      (amax_rowwise_ptr == nullptr) ? 1.0f
+                                    : compute_global_encode_scaling_factor_FP4(*amax_rowwise_ptr);
+  const float S_dec = 1.0f / S_enc;
 
   float thread_amax = 0.0f;
 
@@ -404,8 +407,29 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
           }
         }
 
-        // 2. Compute E4M3 scaling factor
-        const fp8e4m3 S_dec_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc);
+        // 2. Compute scaling factor (Encode-Centric or Decode-Centric)
+        fp8e4m3 S_b_fp8;
+        float block_scale_inverse;
+
+        if constexpr (ENCODE_CENTRIC) {
+            // [Encode-Centric]
+            // Calculate Multiplier directly: M ~ (FP4_MAX / (block_amax * S_enc))
+            fp8e4m3 S_mult_fp8 = compute_encoding_scaling_factor_nv(block_amax, S_enc);
+
+            // Use the calculated Multiplier for quantization
+            block_scale_inverse = static_cast<float>(S_mult_fp8) * S_enc;
+
+            // Store the Reciprocal (Divisor) as the scale
+            S_b_fp8 = static_cast<fp8e4m3>(1.0f / static_cast<float>(S_mult_fp8));
+        } else {
+            // [Decode-Centric / Default]
+            S_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc);
+
+            // Compute "correct" per-block encoding scaling factor
+            constexpr float float_max = detail::TypeExtrema<float>::max;
+            block_scale_inverse = fminf(
+                1.0f / (static_cast<float>(S_b_fp8) * S_dec), float_max);
+        }
 
 #if DIRECT_SCALING_FACTORS_STORE
         // Check boundaries
@@ -414,7 +438,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
               scales_offset_Y_rowwise + stage_rowwise_scales_offset_Y + it * THREADS_Y_ROWWISE;
           const int scales_offset_X = scales_offset_X_rowwise;
           const int scale_idx_global = scales_offset_Y * scale_stride_rowwise + scales_offset_X;
-          scales_rowwise_e4m3[scale_idx_global] = S_dec_b_fp8;
+          scales_rowwise_e4m3[scale_idx_global] = S_b_fp8;
         }
 #else
         const int shmem_scales_offset_Y =
@@ -422,11 +446,8 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
         const int shmem_scales_offset_X = tid_X_rowwise;
         const int scale_idx =
             shmem_scales_offset_Y * NVFP4_SCALING_FACTORS_PER_CHUNK_ROW + shmem_scales_offset_X;
-        out_rowwise_scales_sh[scale_idx] = S_dec_b_fp8;
+        out_rowwise_scales_sh[scale_idx] = S_b_fp8;
 #endif
-        // Compute "correct" per-block encoding scaling factor
-        const float block_scale_inverse =
-            __fdiv_rn(S_enc, static_cast<float>(S_dec_b_fp8));  // S_enc_b_fp8
 
 // 3. Scale elements
 #pragma unroll
@@ -534,7 +555,10 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 // This kernel supports only two scaling cases:
 // 1. r16c0  - Rowwise NVFP4
 // 2. r16c32 - Rowwise NVFP4 AND Colwise MXFP8
-inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output, cudaStream_t stream) {
+// Additionally, ENCODE_CENTRIC controls whether encode-centric or decode-centric
+// scale computation is used.
+inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output,
+                     cudaStream_t stream, bool encode_centric = false) {
 #if FP4_TYPE_SUPPORTED
   using namespace quantize_kernel;
   using namespace ptx;
@@ -585,8 +609,11 @@ inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output, cu
 
   float *const amax_ptr = reinterpret_cast<float *>(output->amax.dptr);
   const float *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
-  const float *const nvfp4_second_stage_scale_ptr =
-      reinterpret_cast<const float *>(output->scale.dptr);
+
+  // Amax pointers for global scale computation
+  // Use output->amax for rowwise, and output->scale for colwise (if available)
+  const float *const amax_rowwise_ptr = reinterpret_cast<const float *>(output->amax.dptr);
+  const float *const amax_colwise_ptr = nullptr;  // TODO: wire colwise amax when needed
 
   // Output data type is only required for the column-wise MXFP8 scaling.
   // It has no effect for the row-wise NVFP4 scaling, but is set to the default E4M3 for the macros to work
@@ -638,36 +665,43 @@ inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output, cu
 
           const size_t dshmem_size = in_mem + out_mem;
 
-          switch (scaling_type) {
-            case ScalingType::ROWWISE: {
-              auto kernel =
-                  quantize_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType, OType, false,
-                                        CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>;
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dshmem_size);
-
-              kernel<<<grid, block_size, dshmem_size, stream>>>(
-                  tensor_map_input, tensor_map_output_rowwise, tensor_map_output_colwise,
-                  scales_rowwise_e4m3_ptr, scales_colwise_e8m0_ptr, noop_ptr, amax_ptr,
-                  nvfp4_second_stage_scale_ptr, rows, cols, scale_stride_rowwise,
-                  scale_stride_colwise);
-              break;
+          // Macro to reduce dispatch boilerplate
+          #define LAUNCH_QUANTIZE_KERNEL(COLWISE, ENCODE_C) \
+            { \
+              auto kernel = \
+                  quantize_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType, OType, \
+                                        COLWISE, ENCODE_C, \
+                                        CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>; \
+              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+                                   dshmem_size); \
+              kernel<<<grid, block_size, dshmem_size, stream>>>( \
+                  tensor_map_input, tensor_map_output_rowwise, tensor_map_output_colwise, \
+                  scales_rowwise_e4m3_ptr, scales_colwise_e8m0_ptr, noop_ptr, amax_ptr, \
+                  amax_rowwise_ptr, amax_colwise_ptr, rows, cols, scale_stride_rowwise, \
+                  scale_stride_colwise); \
             }
-            case ScalingType::BIDIMENSIONAL: {
-              auto kernel =
-                  quantize_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType, OType, true,
-                                        CHUNK_DIM_Y, CHUNK_DIM_X, THREADS_PER_CHUNK>;
-              cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   dshmem_size);
 
-              kernel<<<grid, block_size, dshmem_size, stream>>>(
-                  tensor_map_input, tensor_map_output_rowwise, tensor_map_output_colwise,
-                  scales_rowwise_e4m3_ptr, scales_colwise_e8m0_ptr, noop_ptr, amax_ptr,
-                  nvfp4_second_stage_scale_ptr, rows, cols, scale_stride_rowwise,
-                  scale_stride_colwise);
-              break;
+          if (encode_centric) {
+            switch (scaling_type) {
+              case ScalingType::ROWWISE:
+                LAUNCH_QUANTIZE_KERNEL(false, true);
+                break;
+              case ScalingType::BIDIMENSIONAL:
+                LAUNCH_QUANTIZE_KERNEL(true, true);
+                break;
             }
-          } NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
+          } else {
+            switch (scaling_type) {
+              case ScalingType::ROWWISE:
+                LAUNCH_QUANTIZE_KERNEL(false, false);
+                break;
+              case ScalingType::BIDIMENSIONAL:
+                LAUNCH_QUANTIZE_KERNEL(true, false);
+                break;
+            }
+          }
+          #undef LAUNCH_QUANTIZE_KERNEL
+          NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
   );                                                // NOLINT(*)
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);

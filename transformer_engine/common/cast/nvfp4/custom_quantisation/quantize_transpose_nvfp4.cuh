@@ -108,7 +108,7 @@ constexpr size_t TOTAL_BANKS_WIDTH = (32 * 4 * 8) / 4;  // 256
 constexpr size_t THREADS_PER_BANK = TOTAL_BANKS_WIDTH / SCALE_DIM;  // 8 = 128 / 16
 
 template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
-          typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE>
+          typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE, bool ENCODE_CENTRIC>
 __global__ void __launch_bounds__(THREADS_NUM)
     quantize_transpose_nvfp4_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                     const __grid_constant__ CUtensorMap tensor_map_output,
@@ -335,19 +335,28 @@ __global__ void __launch_bounds__(THREADS_NUM)
             in_compute_colwise[i] = elt;
           }
         }
-        // 2. Compute E4M3 scaling factor
-        const nvfp4_scale_t S_dec_b_fp8 =
-            compute_decoding_scaling_factor(block_amax, S_enc_colwise);
+        // 2. Compute scaling factor (Encode-Centric or Decode-Centric)
+        nvfp4_scale_t S_b_fp8;
+        float block_scale_inverse;
+
+        if constexpr (ENCODE_CENTRIC) {
+            // [Encode-Centric]
+            nvfp4_scale_t S_mult_fp8 = compute_encoding_scaling_factor_nv(block_amax, S_enc_colwise);
+            block_scale_inverse = static_cast<float>(S_mult_fp8) * S_enc_colwise;
+            S_b_fp8 = static_cast<nvfp4_scale_t>(1.0f / static_cast<float>(S_mult_fp8));
+        } else {
+            // [Decode-Centric / Default]
+            S_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc_colwise);
+            constexpr float float_max = detail::TypeExtrema<float>::max;
+            block_scale_inverse = fminf(
+                1.0f / (static_cast<float>(S_b_fp8) * S_dec_colwise), float_max);
+        }
 
         // Store scaling factors through SHMEM
         const size_t scale_idx_sh =
             tid_Y_t * SCALES_PER_CHUNK_Y + stage * ITERATIONS_TRANSPOSE + it;
-        out_colwise_scales_sh[scale_idx_sh] = S_dec_b_fp8;
+        out_colwise_scales_sh[scale_idx_sh] = S_b_fp8;
 
-        // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
-        const float block_scale_inverse = fminf(
-            1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_colwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
 
         // 3. Scale elements
@@ -508,9 +517,22 @@ __global__ void __launch_bounds__(THREADS_NUM)
           }
         }
 
-        // 2. Compute E4M3 scaling factor
-        const nvfp4_scale_t S_dec_b_fp8 =
-            compute_decoding_scaling_factor(block_amax, S_enc_rowwise);
+        // 2. Compute scaling factor (Encode-Centric or Decode-Centric)
+        nvfp4_scale_t S_b_fp8;
+        float block_scale_inverse;
+
+        if constexpr (ENCODE_CENTRIC) {
+            // [Encode-Centric]
+            nvfp4_scale_t S_mult_fp8 = compute_encoding_scaling_factor_nv(block_amax, S_enc_rowwise);
+            block_scale_inverse = static_cast<float>(S_mult_fp8) * S_enc_rowwise;
+            S_b_fp8 = static_cast<nvfp4_scale_t>(1.0f / static_cast<float>(S_mult_fp8));
+        } else {
+            // [Decode-Centric / Default]
+            S_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc_rowwise);
+            constexpr float float_max = detail::TypeExtrema<float>::max;
+            block_scale_inverse = fminf(
+                1.0f / (static_cast<float>(S_b_fp8) * S_dec_rowwise), float_max);
+        }
 
         // Check boundaries
         const size_t scales_offset_Y =
@@ -522,13 +544,9 @@ __global__ void __launch_bounds__(THREADS_NUM)
         const bool rowwise_scale_is_within_bounds_Y =
             (stage_rowwise_scales_offset_Y + it * THREADS_Y_ROWWISE + tid_Y_rowwise) < chunk_rows;
         if (rowwise_scale_is_within_bounds_X && rowwise_scale_is_within_bounds_Y) {
-          scales_ptr[scale_idx_global] = S_dec_b_fp8;
+          scales_ptr[scale_idx_global] = S_b_fp8;
         }
 
-        // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
-        const float block_scale_inverse = fminf(
-            1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_rowwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
 
 // 3. Scale elements
@@ -621,7 +639,7 @@ __global__ void __launch_bounds__(THREADS_NUM)
 }
 
 template <bool COMPUTE_ACTIVATIONS, typename ParamOP, float (*OP)(float, const ParamOP &),
-          typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE>
+          typename IType, bool USE_STOCHASTIC_ROUNDING, bool RETURN_TRANSPOSE, bool ENCODE_CENTRIC>
 __global__ void __launch_bounds__(THREADS_NUM)
     quantize_transpose_nvfp4_2D_kernel(const __grid_constant__ CUtensorMap tensor_map_input,
                                        const __grid_constant__ CUtensorMap tensor_map_output,
@@ -916,19 +934,26 @@ __global__ void __launch_bounds__(THREADS_NUM)
           }
         }
 
-        // 2. Compute E4M3 scaling factor
-        const nvfp4_scale_t S_dec_b_fp8 =
-            compute_decoding_scaling_factor(block_amax, S_enc_colwise);
+        // 2. Compute scaling factor (Encode-Centric or Decode-Centric)
+        nvfp4_scale_t S_b_fp8;
+        float block_scale_inverse;
 
-        // // Store scaling factors through SHMEM
+        if constexpr (ENCODE_CENTRIC) {
+            nvfp4_scale_t S_mult_fp8 = compute_encoding_scaling_factor_nv(block_amax, S_enc_colwise);
+            block_scale_inverse = static_cast<float>(S_mult_fp8) * S_enc_colwise;
+            S_b_fp8 = static_cast<nvfp4_scale_t>(1.0f / static_cast<float>(S_mult_fp8));
+        } else {
+            S_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc_colwise);
+            constexpr float float_max = detail::TypeExtrema<float>::max;
+            block_scale_inverse = fminf(
+                1.0f / (static_cast<float>(S_b_fp8) * S_dec_colwise), float_max);
+        }
+
+        // Store scaling factors through SHMEM
         const size_t scale_idx_sh =
             tid_Y_t * SCALES_PER_CHUNK_Y + stage * ITERATIONS_TRANSPOSE + it;
-        out_colwise_scales_sh[scale_idx_sh] = S_dec_b_fp8;
+        out_colwise_scales_sh[scale_idx_sh] = S_b_fp8;
 
-        // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
-        const float block_scale_inverse = fminf(
-            1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_colwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
 
         fp4e2m1x4 regs[SCALE_DIM / 4];
@@ -1041,9 +1066,20 @@ __global__ void __launch_bounds__(THREADS_NUM)
           }
         }
 
-        // 2. Compute E4M3 scaling factor
-        const nvfp4_scale_t S_dec_b_fp8 =
-            compute_decoding_scaling_factor(block_amax, S_enc_rowwise);
+        // 2. Compute scaling factor (Encode-Centric or Decode-Centric)
+        nvfp4_scale_t S_b_fp8;
+        float block_scale_inverse;
+
+        if constexpr (ENCODE_CENTRIC) {
+            nvfp4_scale_t S_mult_fp8 = compute_encoding_scaling_factor_nv(block_amax, S_enc_rowwise);
+            block_scale_inverse = static_cast<float>(S_mult_fp8) * S_enc_rowwise;
+            S_b_fp8 = static_cast<nvfp4_scale_t>(1.0f / static_cast<float>(S_mult_fp8));
+        } else {
+            S_b_fp8 = compute_decoding_scaling_factor(block_amax, S_enc_rowwise);
+            constexpr float float_max = detail::TypeExtrema<float>::max;
+            block_scale_inverse = fminf(
+                1.0f / (static_cast<float>(S_b_fp8) * S_dec_rowwise), float_max);
+        }
 
         // Check boundaries
         const size_t scales_offset_Y =
@@ -1051,17 +1087,12 @@ __global__ void __launch_bounds__(THREADS_NUM)
         const size_t scales_offset_X = scales_offset_X_rowwise;
         const size_t scale_idx_global = scales_offset_Y * scale_stride + scales_offset_X;
 
-        // const bool rowwise_scale_is_within_bounds_Y = scales_offset_Y < rows;
         const bool rowwise_scale_is_within_bounds_Y =
             (stage_rowwise_scales_offset_Y + it * THREADS_Y_ROWWISE + tid_Y_rowwise) < chunk_rows;
         if (rowwise_scale_is_within_bounds_X && rowwise_scale_is_within_bounds_Y) {
-          scales_ptr[scale_idx_global] = S_dec_b_fp8;
+          scales_ptr[scale_idx_global] = S_b_fp8;
         }
 
-        // Compute "correct" per-block encoding scaling factor
-        constexpr float float_max = detail::TypeExtrema<float>::max;
-        const float block_scale_inverse = fminf(
-            1.0f / (static_cast<float>(S_dec_b_fp8) * S_dec_rowwise), float_max);  // S_enc_b_fp8
         const float2 block_scale_inverse_2x{block_scale_inverse, block_scale_inverse};
 
         // 3. Scale elements
@@ -1269,12 +1300,15 @@ void quantize_transpose(const Tensor &input, const Tensor *noop, Tensor *output,
       use_stochastic_rounding, USE_STOCHASTIC_ROUNDING,
 
       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_transpose, RETURN_TRANSPOSE, {
+        // Default to decode-centric (ENCODE_CENTRIC=false) for backward compatibility
         auto kernel = quantize_transpose_nvfp4_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
-                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
+                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE,
+                                                      false>;
 
         if constexpr (use_2d_quantization) {
           kernel = quantize_transpose_nvfp4_2D_kernel<COMPUTE_ACTIVATIONS, ParamOP, OP, IType,
-                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE>;
+                                                      USE_STOCHASTIC_ROUNDING, RETURN_TRANSPOSE,
+                                                      false>;
         }
 
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size);

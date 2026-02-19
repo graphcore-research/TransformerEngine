@@ -36,19 +36,28 @@ using nvfp4_scale_t = fp8e4m3;
 namespace quantization_and_transposition_SF {
 #if FP4_TYPE_SUPPORTED
 // Used in transpose variant
-// Compute per-block E4M3 encoding/decoding scaling factor
+// Compute per-block E4M3 encoding/decoding scaling factor (Decode-Centric)
 __device__ __forceinline__ nvfp4_scale_t compute_decoding_scaling_factor(const float block_amax,
                                                                          const float S_enc) {
-  // constexpr float rcp_6f = 1.0f / 6.0f;
-  // const float S_dec_b = block_amax * rcp_6f;
-  // const nvfp4_scale_t S_dec_b_fp8 = static_cast<nvfp4_scale_t>(S_dec_b * S_enc);
-  // return S_dec_b_fp8;
-  // NOTE: Divide by 6.0f is not elegant and not efficient.
-  // However, this is part of the emulation code to ensure exact match.
   using namespace detail;
   constexpr float fp4_max = TypeExtrema<fp4e2m1>::max;  // 6.0f;
   const float S_dec_b = block_amax / fp4_max * S_enc;
   return static_cast<nvfp4_scale_t>(fminf(S_dec_b, TypeExtrema<float>::max));
+}
+
+// Compute per-block E4M3 encoding scaling factor (Encode-Centric)
+// Returns the Multiplier: M = fp4_max / (block_amax * S_enc), cast to E4M3
+__device__ __forceinline__ nvfp4_scale_t compute_encoding_scaling_factor_nv(const float block_amax,
+                                                                            const float S_enc) {
+  using namespace detail;
+  constexpr float fp4_max = TypeExtrema<fp4e2m1>::max;  // 6.0f
+
+  if (block_amax <= 1.0e-9f) {
+      return static_cast<nvfp4_scale_t>(TypeExtrema<fp8e4m3>::max);
+  }
+
+  const float M = fp4_max / (block_amax * S_enc);
+  return static_cast<nvfp4_scale_t>(fminf(M, TypeExtrema<float>::max));
 }
 #endif  // FP4_TYPE_SUPPORTED
 }  // namespace quantization_and_transposition_SF
@@ -56,14 +65,29 @@ __device__ __forceinline__ nvfp4_scale_t compute_decoding_scaling_factor(const f
 namespace quantization_SF {
 #if FP4_TYPE_SUPPORTED
 // Used in non-transpose variant
-// Compute per-block E4M3 encoding/decoding scaling factor
+// Compute per-block E4M3 encoding/decoding scaling factor (Decode-Centric)
+// Returns the Divisor: S_dec_b = block_amax / fp4_max * S_enc, cast to E4M3
 __device__ __forceinline__ fp8e4m3 compute_decoding_scaling_factor(const float block_amax,
                                                                    const float S_enc) {
   constexpr float rcp_6f = 1.0f / 6.0f;
-  // const float S_dec_b = block_amax * rcp_6f;
-  // const fp8e4m3 S_dec_b_fp8 = static_cast<fp8e4m3>(S_dec_b * S_enc);
-  // return S_dec_b_fp8;
   return static_cast<fp8e4m3>(block_amax * rcp_6f * S_enc);
+}
+
+// Compute per-block E4M3 encoding scaling factor (Encode-Centric)
+// Returns the Multiplier: M = fp4_max / (block_amax * S_enc), cast to E4M3
+__device__ __forceinline__ fp8e4m3 compute_encoding_scaling_factor_nv(const float block_amax,
+                                                                      const float S_enc) {
+  using namespace detail;
+  constexpr float fp4_max = TypeExtrema<fp4e2m1>::max;  // 6.0f
+
+  // In Encode Centric, we want the Multiplier M = fp4_max / (block_amax * S_enc)
+  // to be representable in FP8.
+  if (block_amax <= 1.0e-9f) {
+      return static_cast<fp8e4m3>(TypeExtrema<fp8e4m3>::max);
+  }
+
+  const float M = fp4_max / (block_amax * S_enc);
+  return static_cast<fp8e4m3>(fminf(M, TypeExtrema<float>::max));
 }
 #endif  // FP4_TYPE_SUPPORTED
 }  // namespace quantization_SF
