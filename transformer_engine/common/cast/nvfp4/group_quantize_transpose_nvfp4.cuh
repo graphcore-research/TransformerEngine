@@ -202,17 +202,15 @@ __global__ void __launch_bounds__(THREADS_NUM)
   const size_t block_offset_Y = blockIdx.y * CHUNK_DIM_Y;
   const size_t block_offset_X = blockIdx.x * CHUNK_DIM_X;
 
-  // TODO(zhongbo): add back when transpose is supported
-  // const size_t block_offset_Y_t = blockIdx.x * CHUNK_DIM_X;
-  // const size_t block_offset_X_t = blockIdx.y * CHUNK_DIM_Y;
+  const size_t block_offset_Y_t = blockIdx.x * CHUNK_DIM_X;
+  const size_t block_offset_X_t = blockIdx.y * CHUNK_DIM_Y;
 
   const size_t chunk_rows = rows - block_offset_Y;
 
   const size_t scales_block_offset_Y_rowwise = blockIdx.y * CHUNK_DIM_Y;
   const size_t scales_block_offset_X_rowwise = blockIdx.x * SCALES_PER_CHUNK_X;
-  // TODO(zhongbo): add back when transpose is supported
-  // const size_t scales_block_offset_Y_t = blockIdx.x * CHUNK_DIM_X;
-  // const size_t scales_block_offset_X_t = blockIdx.y * SCALES_PER_CHUNK_Y;
+  const size_t scales_block_offset_Y_t = blockIdx.x * CHUNK_DIM_X;
+  const size_t scales_block_offset_X_t = blockIdx.y * SCALES_PER_CHUNK_Y;
 
   const size_t tid_Y_rowwise = threadIdx.x / THREADS_X_ROWWISE;
   const size_t tid_X_rowwise = threadIdx.x % THREADS_X_ROWWISE;
@@ -232,16 +230,14 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   const size_t scales_offset_Y_rowwise = scales_block_offset_Y_rowwise + tid_Y_rowwise;
   const size_t scales_offset_X_rowwise = scales_block_offset_X_rowwise + tid_X_rowwise;
-  // TODO(zhongbo): add back when transpose is supported
-  // const size_t scales_offset_Y_t = scales_block_offset_Y_t + tid_Y_t;
-  // const size_t scales_offset_X_t = scales_block_offset_X_t;
+  const size_t scales_offset_Y_t = scales_block_offset_Y_t + tid_Y_t;
+  const size_t scales_offset_X_t = scales_block_offset_X_t;
 
   const size_t SFs_per_row = cols / SCALE_DIM;
 
   const bool rowwise_scale_is_within_bounds_X = scales_offset_X_rowwise < SFs_per_row;
 
-  // TODO(zhongbo): add back when transpose is supported
-  // const bool colwise_scale_is_within_bounds_Y = scales_offset_Y_t < cols;
+  const bool colwise_scale_is_within_bounds_Y = scales_offset_Y_t < cols;
 
   // Helps resolving bank conflicts in shmem
   const int thread_lane = threadIdx.x % THREADS_PER_WARP;
@@ -283,15 +279,18 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
   const bool is_master_thread = (threadIdx.x == 0);
 
-  // TODO (zhongbo): finish this
   float *amax_rowwise_ptr = nullptr;
   float *amax_colwise_ptr = nullptr;
   nvfp4_scale_t *split_rowwise_scale_ptr = nullptr;
+  // Per-split colwise output pointers for transpose
+  fp4e2m1x2 *split_colwise_data_ptr = nullptr;
+  nvfp4_scale_t *split_colwise_scale_ptr = nullptr;
+  int split_colwise_scale_stride = 0;
 
   // suppose the amax is fixed for the current 128x128 tile (need 128 padding)
   bool need_update_tensor_id = true;
   int tensor_id = GetTensorIdAndBoundary(&kernel_args, block_offset_Y, block_offset_Y + CHUNK_DIM_Y,
-                                         &need_update_tensor_id);
+                                          &need_update_tensor_id);
   size_t split_start = kernel_args.split_sections_range[tensor_id];
   size_t split_end = kernel_args.split_sections_range[tensor_id + 1];
   amax_rowwise_ptr = reinterpret_cast<float *>(kernel_args.rowwise_amax_list[tensor_id]);
@@ -302,9 +301,15 @@ __global__ void __launch_bounds__(THREADS_NUM)
   float S_dec_rowwise = 1.0f;
   UpdateEncodeDecodeScaleFP32(amax_rowwise_ptr, &S_enc_rowwise, &S_dec_rowwise);
 
-  // TODO (zhongbo): colwise scaling disabled for now because of transpose
+  // Colwise scaling: use per-split amax pointers from kernel_args
   float S_enc_colwise = 1.0f;
   float S_dec_colwise = 1.0f;
+  if constexpr (RETURN_TRANSPOSE) {
+    amax_colwise_ptr = reinterpret_cast<float *>(kernel_args.colwise_amax_list[tensor_id]);
+    split_colwise_data_ptr = reinterpret_cast<fp4e2m1x2 *>(kernel_args.output_colwise_data_list[tensor_id]);
+    split_colwise_scale_ptr = reinterpret_cast<nvfp4_scale_t *>(kernel_args.output_colwise_scale_inv_list[tensor_id]);
+    split_colwise_scale_stride = kernel_args.output_colwise_scale_stride[tensor_id];
+  }
   if (amax_colwise_ptr != nullptr) {
     UpdateEncodeDecodeScaleFP32(amax_colwise_ptr, &S_enc_colwise, &S_dec_colwise);
   } else {
@@ -345,8 +350,16 @@ __global__ void __launch_bounds__(THREADS_NUM)
         UpdateEncodeDecodeScaleFP32(amax_rowwise_ptr, &S_enc_rowwise, &S_dec_rowwise);
         split_rowwise_scale_ptr =
             reinterpret_cast<nvfp4_scale_t *>(kernel_args.output_rowwise_scale_inv_list[tensor_id]);
-        // TODO (zhongbo): colwise scaling disabled for now because of transpose
-        // Skip fetching colwise amax pointer and scaling factor updates
+        // Update colwise pointers for the new split
+        if constexpr (RETURN_TRANSPOSE) {
+          amax_colwise_ptr = reinterpret_cast<float *>(kernel_args.colwise_amax_list[tensor_id]);
+          split_colwise_data_ptr = reinterpret_cast<fp4e2m1x2 *>(kernel_args.output_colwise_data_list[tensor_id]);
+          split_colwise_scale_ptr = reinterpret_cast<nvfp4_scale_t *>(kernel_args.output_colwise_scale_inv_list[tensor_id]);
+          split_colwise_scale_stride = kernel_args.output_colwise_scale_stride[tensor_id];
+          if (amax_colwise_ptr != nullptr) {
+            UpdateEncodeDecodeScaleFP32(amax_colwise_ptr, &S_enc_colwise, &S_dec_colwise);
+          }
+        }
       }
     }
 
@@ -688,45 +701,59 @@ __global__ void __launch_bounds__(THREADS_NUM)
       const size_t global_offset_Y = block_offset_Y + stage_offset_Y;
       const size_t global_offset_X = block_offset_X;
 
-      // TODO(zhongbo): add back when transpose is supported
-      // const size_t global_offset_Y_t = block_offset_Y_t;
-      // const size_t global_offset_X_t = block_offset_X_t + stage_offset_Y;
-
       ptx::cp_async_bulk_tensor_2d_shared_to_global(
           reinterpret_cast<const uint64_t *>(&tensor_map_output), global_offset_X, global_offset_Y,
           reinterpret_cast<uint64_t *>(&out_data_sh[buff_offset_out]));
 
-      // TODO(zhongbo): add back when transpose is supported
-      // if constexpr (RETURN_TRANSPOSE) {
-      //   ptx::cp_async_bulk_tensor_2d_shared_to_global(
-      //       reinterpret_cast<const uint64_t *>(&tensor_map_output_t), global_offset_X_t,
-      //       global_offset_Y_t, reinterpret_cast<uint64_t *>(&out_t_data_sh[buff_offset_out_t]));
-      // }
-
       // Create a "bulk async-group" out of the previous bulk copy operation.
       ptx::cp_async_bulk_commit_group();
     }
+
+    // Direct GMEM store for transposed FP4 data (per-split output buffers)
+    if constexpr (RETURN_TRANSPOSE) {
+      __syncthreads();
+      // Each thread stores its portion of transposed data from smem to per-split GMEM
+      // The transposed output layout: (K, split_rows) where split_rows = split_end - split_start
+      // block_offset_X maps to rows in transposed, stage_offset_Y maps to cols in transposed
+      const size_t split_rows = split_end - split_start;
+      const size_t t_row = block_offset_X + threadIdx.x;  // column in original = row in transposed
+      const size_t t_col_base = block_offset_Y + stage_offset_Y - split_start;  // row in original (offset within split) = col in transposed
+      if (t_row < cols && split_colwise_data_ptr != nullptr) {
+        // Each stage processes BUFF_DIM_Y rows. Store BUFF_DIM_Y/2 fp4e2m1x2 elements per row
+        for (size_t dy = 0; dy < BUFF_DIM_Y; dy += 2) {
+          size_t t_col = t_col_base + dy;
+          if (t_col + 1 < split_rows) {
+            size_t sh_idx = buff_offset_out_t + threadIdx.x * BUFF_OUT_T_DIM_X + dy / 2;
+            size_t gm_idx = t_row * (split_rows / 2) + t_col / 2;
+            split_colwise_data_ptr[gm_idx] = out_t_data_sh[sh_idx];
+          }
+        }
+      }
+    }
   }  // end of stages
 
-  // TODO(zhongbo): add back when transpose is supported
-  // Vectorized store scaling factors through SHMEM
-  // if (RETURN_TRANSPOSE && colwise_scale_is_within_bounds_Y) {
-  //   using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
-  //   const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
-  //   ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(&out_colwise_scales_sh[scale_idx_sh]);
-  //   const size_t scale_idx_global = scales_offset_Y_t * scale_stride_t + scales_offset_X_t;
-  //   const size_t count =  // number of scales in Y dimension of this chunk
-  //       (chunk_rows >= CHUNK_DIM_Y) ? SCALES_PER_CHUNK_Y : (chunk_rows / SCALE_DIM);
-  //   nvfp4_scale_t *dst = &scales_t_ptr[scale_idx_global];
-  //   constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
-  //   if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
-  //     // Fast path: vectorized store when destination is properly aligned
-  //     scales_vec.store_to(dst);
-  //   } else {
-  //     // Safe path: element-wise store for tails or unaligned destinations
-  //     scales_vec.store_to_elts(dst, 0, count);
-  //   }
-  // }
+  // Colwise scale store — direct GMEM write to per-split scale buffer
+  if constexpr (RETURN_TRANSPOSE) {
+    if (colwise_scale_is_within_bounds_Y && split_colwise_scale_ptr != nullptr) {
+      using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
+      const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
+      ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(&out_colwise_scales_sh[scale_idx_sh]);
+      // Use split-relative offset for X: block_offset_Y is the global row,
+      // split_start is the first row of this split. The colwise scale buffer
+      // only has (split_rows / SCALE_DIM) columns, not (total_rows / SCALE_DIM).
+      const size_t split_relative_X_t = (block_offset_Y - split_start) / SCALE_DIM;
+      const size_t scale_idx_global = scales_offset_Y_t * split_colwise_scale_stride + split_relative_X_t;
+      const size_t count =
+          (chunk_rows >= CHUNK_DIM_Y) ? SCALES_PER_CHUNK_Y : (chunk_rows / SCALE_DIM);
+      nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
+      constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
+      if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
+        scales_vec.store_to(dst);
+      } else {
+        scales_vec.store_to_elts(dst, 0, count);
+      }
+    }
+  }
 
   destroy_barriers<STAGES>(mbar, is_master_thread);
 #else
@@ -767,8 +794,7 @@ void group_quantize_transpose(const Tensor &input, const Tensor *noop,
   // If transposed output is allocated, return the transposed data. Otherwise, it's not necesary to
   // return the transposed data.
   bool return_transpose = output->has_columnwise_data();
-  // forbid return transpose for now because group quantize transpose is not supported yet
-  NVTE_CHECK(!return_transpose, "Return transpose is not supported for group quantize transpose.");
+  // Transpose is now supported via direct GMEM stores to per-split buffers
 
   // output_List is contiguous in memory, so take the first tensor as the contiguous output
   auto output_contiguous = output->data;
@@ -799,15 +825,31 @@ void group_quantize_transpose(const Tensor &input, const Tensor *noop,
     if (split_sections[i] == 0) {
       continue;
     }
-    kernel_args.rowwise_amax_list[kernel_args.num_tensors] =
+    int idx = kernel_args.num_tensors;
+    kernel_args.rowwise_amax_list[idx] =
         reinterpret_cast<void *>(output_list[i]->amax.dptr);
-    kernel_args.output_rowwise_scale_inv_list[kernel_args.num_tensors] =
+    kernel_args.output_rowwise_scale_inv_list[idx] =
         reinterpret_cast<void *>(output_list[i]->scale_inv.dptr);
-    // kernel_args.split_sections[kernel_args.num_tensors] = split_sections[i];
-    kernel_args.split_sections_range[kernel_args.num_tensors + 1] =
-        kernel_args.split_sections_range[kernel_args.num_tensors] + split_sections[i];
-    // check overflow
-    NVTE_CHECK(kernel_args.split_sections_range[kernel_args.num_tensors + 1] >= 0,
+    // Wire up colwise (transpose) fields from output tensors
+    if (return_transpose && output_list[i]->has_columnwise_data()) {
+      kernel_args.colwise_amax_list[idx] =
+          reinterpret_cast<void *>(output_list[i]->columnwise_amax.dptr);
+      kernel_args.output_colwise_data_list[idx] =
+          reinterpret_cast<void *>(output_list[i]->columnwise_data.dptr);
+      kernel_args.output_colwise_scale_inv_list[idx] =
+          reinterpret_cast<void *>(output_list[i]->columnwise_scale_inv.dptr);
+      kernel_args.output_colwise_scale_stride[idx] =
+          static_cast<int>(output_list[i]->columnwise_scale_inv.shape.size() > 1
+                           ? output_list[i]->columnwise_scale_inv.shape[1] : 0);
+    } else {
+      kernel_args.colwise_amax_list[idx] = nullptr;
+      kernel_args.output_colwise_data_list[idx] = nullptr;
+      kernel_args.output_colwise_scale_inv_list[idx] = nullptr;
+      kernel_args.output_colwise_scale_stride[idx] = 0;
+    }
+    kernel_args.split_sections_range[idx + 1] =
+        kernel_args.split_sections_range[idx] + split_sections[i];
+    NVTE_CHECK(kernel_args.split_sections_range[idx + 1] >= 0,
                "split_sections_range overflow the int32_t");
     kernel_args.num_tensors++;
   }
