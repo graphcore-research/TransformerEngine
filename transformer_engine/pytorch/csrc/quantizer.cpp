@@ -1728,7 +1728,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(const std::ve
   using namespace pybind11::literals;
 
   // Scaling factor format
-  const bool with_gemm_swizzled_scales = false;  /// TODO (tmoon) self->optimize_for_gemm
+  const bool with_gemm_swizzled_scales = this->optimize_for_gemm;
 
   // Tensor dimensions
   const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
@@ -1990,7 +1990,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
   NVTE_CHECK(detail::IsNVFP4Tensor(tensor.ptr()), "NVFP4Quantizer must output to IsNVFP4Tensor.");
 
   // Scaling factor format
-  const bool with_gemm_swizzled_scales = false;  // TODO (tmoon) Enable with optimize_for_gemm
+  const bool with_gemm_swizzled_scales = this->optimize_for_gemm;
 
   // Extract buffers from Python tensor
   auto get_tensor = [&tensor](const char* name) -> std::optional<at::Tensor> {

@@ -817,7 +817,7 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
   const auto columnwise_usage = quantizer_cpp_list[0]->columnwise_usage;
   const auto scaling_mode = quantizer_cpp_list[0]->get_scaling_mode();
   const auto fp4_dtype = quantizer_cpp_list[0]->dtype;
-  const bool with_gemm_swizzled_scales = false;  /// TODO (tmoon) Enable based on optimize_for_gemm;
+  const bool with_gemm_swizzled_scales = quantizer_cpp_list[0]->optimize_for_gemm;
   constexpr size_t scale_elem_size = 1;
 
   // Helper function to construct tensor view

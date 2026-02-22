@@ -89,6 +89,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
     # Input absolute maximum value (used to compute tensor scale for
     # column-scaled FP4 data)
     _amax_columnwise: torch.Tensor
+    _with_gemm_swizzled_scales: bool
 
     # Builder class for casting to MXFP8
     _quantizer: Optional[Quantizer]
