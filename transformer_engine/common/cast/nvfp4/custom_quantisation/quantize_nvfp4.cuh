@@ -60,7 +60,8 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
                           const float *const amax_rowwise_ptr,
                           const float *const amax_colwise_ptr, const size_t rows,
                           const size_t cols, const size_t scale_stride_rowwise,
-                          const size_t scale_stride_colwise) {
+                          const size_t scale_stride_colwise,
+                          const bool swizzle_scales = false) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   constexpr bool ROWWISE_SCALING = true;
   constexpr bool NO_ACTIVATIONS_NOT_FP32_INPUT =
@@ -434,11 +435,27 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
 #if DIRECT_SCALING_FACTORS_STORE
         // Check boundaries
         if (rowwise_scale_is_within_bounds) {
-          const int scales_offset_Y =
+          const int scales_Y =
               scales_offset_Y_rowwise + stage_rowwise_scales_offset_Y + it * THREADS_Y_ROWWISE;
-          const int scales_offset_X = scales_offset_X_rowwise;
-          const int scale_idx_global = scales_offset_Y * scale_stride_rowwise + scales_offset_X;
-          scales_rowwise_e4m3[scale_idx_global] = S_b_fp8;
+          const int scales_X = scales_offset_X_rowwise;
+          if (swizzle_scales) {
+            // Write scales directly in cuBLASLt/TK-swizzled layout.
+            // Layout: 128-row × 4-scale tiles (512 bytes each).
+            const int tile_m = scales_Y / 128;
+            const int row_in_tile = scales_Y % 128;
+            const int tile_k = scales_X / 4;
+            const int k_byte = scales_X % 4;
+            const int j = row_in_tile % 32;
+            const int group = row_in_tile / 32;
+            const int num_tiles_k = static_cast<int>(scale_stride_rowwise) / 4;
+            const int tile_start = (tile_m * num_tiles_k + tile_k) * 512;
+            const int byte_in_tile = j * 16 + group * 4 + k_byte;
+            reinterpret_cast<uint8_t*>(scales_rowwise_e4m3)[tile_start + byte_in_tile] =
+                reinterpret_cast<const uint8_t&>(S_b_fp8);
+          } else {
+            const int scale_idx_global = scales_Y * scale_stride_rowwise + scales_X;
+            scales_rowwise_e4m3[scale_idx_global] = S_b_fp8;
+          }
         }
 #else
         const int shmem_scales_offset_Y =
@@ -573,7 +590,7 @@ inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output,
 
   NVTE_CHECK(is_fp4_dtype(output->data.dtype), "Output must have FP4 type.");
   NVTE_CHECK(output->scale_inv.dptr != nullptr, "Scaling tensor must be allocated");
-  NVTE_CHECK(!output->with_gemm_swizzled_scales, "Output must have scales in compact format.");
+  // Note: with_gemm_swizzled_scales controls whether scales are written in swizzled layout
 
   bool use_colwise_scaling = output->has_columnwise_data();
   if (use_colwise_scaling) {
@@ -678,7 +695,7 @@ inline void quantize(const Tensor &input, const Tensor *noop, Tensor *output,
                   tensor_map_input, tensor_map_output_rowwise, tensor_map_output_colwise, \
                   scales_rowwise_e4m3_ptr, scales_colwise_e8m0_ptr, noop_ptr, amax_ptr, \
                   amax_rowwise_ptr, amax_colwise_ptr, rows, cols, scale_stride_rowwise, \
-                  scale_stride_colwise); \
+                  scale_stride_colwise, output->with_gemm_swizzled_scales); \
             }
 
           if (encode_centric) {
