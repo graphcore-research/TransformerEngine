@@ -52,6 +52,8 @@ struct MultiAmaxCastTransposeFusionArgs {
   int split_sections_range[kMaxTensorsPerKernel + 1];
   // Number of tensors (splits) being processed by kernel
   int num_tensors;
+  // Whether to write scales in cuBLASLt/TK swizzled layout
+  bool swizzle_scales;
 };
 
 __device__ __forceinline__ int GetTensorId(MultiAmaxCastTransposeFusionArgs *kernel_args_ptr,
@@ -646,7 +648,23 @@ __global__ void __launch_bounds__(THREADS_NUM)
 
         if (rowwise_scale_is_within_bounds_X && rowwise_scale_is_within_bounds_Y &&
             local_rowwise_scale_is_within_bounds_Y) {
-          split_rowwise_scale_ptr[scale_idx_local] = S_dec_b_fp8;
+          if (kernel_args.swizzle_scales) {
+            // Write scales in cuBLASLt/TK-swizzled layout.
+            // Layout: 128-row × 4-scale tiles (512 bytes each).
+            const int tile_m = local_scale_row / 128;
+            const int row_in_tile = local_scale_row % 128;
+            const int tile_k = scales_offset_X / 4;
+            const int k_byte = scales_offset_X % 4;
+            const int j = row_in_tile % 32;
+            const int grp = row_in_tile / 32;
+            const int num_tiles_k = static_cast<int>(scale_stride) / 4;
+            const int tile_start = (tile_m * num_tiles_k + tile_k) * 512;
+            const int byte_in_tile = j * 16 + grp * 4 + k_byte;
+            reinterpret_cast<uint8_t*>(split_rowwise_scale_ptr)[tile_start + byte_in_tile] =
+                reinterpret_cast<const uint8_t&>(S_dec_b_fp8);
+          } else {
+            split_rowwise_scale_ptr[scale_idx_local] = S_dec_b_fp8;
+          }
         }
 
         // Compute "correct" per-block encoding scaling factor
@@ -853,6 +871,9 @@ void group_quantize_transpose(const Tensor &input, const Tensor *noop,
                "split_sections_range overflow the int32_t");
     kernel_args.num_tensors++;
   }
+
+  // Set swizzle flag from first output tensor
+  kernel_args.swizzle_scales = output->with_gemm_swizzled_scales;
 
   const size_t blocks_Y = DIVUP(rows, CHUNK_DIM_Y);
   const size_t blocks_X = DIVUP(cols, CHUNK_DIM_X);

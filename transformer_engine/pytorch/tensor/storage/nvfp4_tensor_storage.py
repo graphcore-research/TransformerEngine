@@ -114,6 +114,14 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
         fake_dtype: Optional[torch.dtype] = None,
         **kwargs,
     ):
+        _with_gemm_swizzled_scales = kwargs.pop(
+            "with_gemm_swizzled_scales", with_gemm_swizzled_scales
+        )
+        # Also accept as first positional *arg (C++ passes it positionally).
+        if args and isinstance(args[0], bool):
+            _with_gemm_swizzled_scales = args[0]
+            args = args[1:]
+
         if cls is NVFP4TensorStorage:
             instance = object.__new__(cls)
             instance._dtype = fake_dtype if fake_dtype is not None else torch.float32
@@ -128,7 +136,7 @@ class NVFP4TensorStorage(QuantizedTensorStorage):
         instance._columnwise_scale_inv = columnwise_scale_inv
         instance._amax_rowwise = amax_rowwise
         instance._amax_columnwise = amax_columnwise
-        instance._with_gemm_swizzled_scales = with_gemm_swizzled_scales
+        instance._with_gemm_swizzled_scales = _with_gemm_swizzled_scales
 
         return instance
 
