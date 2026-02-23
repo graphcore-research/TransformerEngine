@@ -177,7 +177,7 @@ void nvte_splits_to_offsets(const int64_t *first_dims, int64_t *output, size_t n
 }
 }  // extern "C"
 
-void checkCuDriverContext(CUstream stream) {
+NVTE_EXPORT void checkCuDriverContext(CUstream stream) {
   // Ensure the thread's "current" CUDA context is set.
   cuda_driver::ensure_context_exists();
 
@@ -225,7 +225,7 @@ CUtensorMapDataType get_CUtensorMapDataType(DType dtype) {
 }
 
 // Set up parameters to create TMA descriptor.
-void create_2D_tensor_map(CUtensorMap &tensorMap, const SimpleTensor &tensor,
+NVTE_EXPORT void create_2D_tensor_map(CUtensorMap &tensorMap, const SimpleTensor &tensor,
                           const uint64_t globalY, const uint64_t globalX, const uint32_t shmemY,
                           const uint32_t shmemX, const uint32_t stride_elems,
                           const uint32_t offset_elems, const size_t type_num_bits,

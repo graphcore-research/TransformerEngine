@@ -53,7 +53,7 @@ std::string to_string(const NVTEScalingMode &mode) {
   return "Invalid Scaling";
 }
 
-void CheckNoopTensor(const Tensor &t, const std::string &name) {
+NVTE_EXPORT void CheckNoopTensor(const Tensor &t, const std::string &name) {
   if (t.data.has_data()) {
     NVTE_CHECK(t.numel() == 1, "Expected 1 element for ", name, " noop, but found ", t.numel(),
                ".");
@@ -146,7 +146,8 @@ void CheckScaleTensorShape(const Tensor &t, const std::string &name) {
   }
 }
 
-void CheckInputTensor(const Tensor &t, const std::string &name, bool check_scale_inv_shapes) {
+NVTE_EXPORT void CheckInputTensor(const Tensor &t, const std::string &name,
+                                  bool check_scale_inv_shapes) {
   const DType type = t.dtype();
   if (is_fp8_dtype(type)) {
     // FP8 input needs to have scale_inv
@@ -202,7 +203,7 @@ void CheckInputTensor(const Tensor &t, const std::string &name, bool check_scale
   }
 }
 
-void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty) {
+NVTE_EXPORT void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty) {
   const DType type = t.dtype();
   if (is_fp8_dtype(type)) {
     // FP8 output needs to have scale, scale_inv and (if delayed scaling) amax
@@ -506,11 +507,11 @@ class TensorAllocator {
   bool debug = false;
 };
 
-Tensor *convertNVTETensor(const NVTETensor t) {
+NVTE_EXPORT Tensor *convertNVTETensor(const NVTETensor t) {
   return TensorAllocator::instance().convertNVTETensor(t);
 }
 
-Tensor *convertNVTETensorCheck(const NVTETensor t) {
+NVTE_EXPORT Tensor *convertNVTETensorCheck(const NVTETensor t) {
   Tensor *ptr = TensorAllocator::instance().convertNVTETensor(t);
   NVTE_CHECK(ptr != nullptr, "Invalid tensor.");
   return ptr;

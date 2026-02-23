@@ -19,7 +19,14 @@
 			*transformer_engine::CommOverlapP2PBase*;
 			*transformer_engine::CommOverlapCore*;
 			*nvshmem_wait_on_stream*;
-			*nvshmemi_init_thread*
+			*nvshmemi_init_thread*;
+                        transformer_engine::convertNVTETensor*;
+                        transformer_engine::CheckInputTensor*;
+                        transformer_engine::CheckOutputTensor*;
+                        transformer_engine::CheckNoopTensor*;
+                        transformer_engine::checkCuDriverContext*;
+                        transformer_engine::create_2D_tensor_map*;
+                        transformer_engine::to_string*
 		};
 	local: *;
 };

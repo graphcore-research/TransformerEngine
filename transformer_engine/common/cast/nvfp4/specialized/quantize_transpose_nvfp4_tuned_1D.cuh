@@ -357,7 +357,8 @@ __global__ void __launch_bounds__(THREADS_NUM) quantize_transpose_nvfp4_tuned_1D
     const __grid_constant__ CUtensorMap tensor_map_output_t, nvfp4_scale_t *const scales_ptr,
     nvfp4_scale_t *const scales_t_ptr, const float *noop, const float *const amax_rowwise_ptr,
     const float *const amax_colwise_ptr, const size_t rows, const size_t cols,
-    const size_t scale_stride, const size_t scale_stride_t, const size_t *rng_state) {
+    const size_t scale_stride, const size_t scale_stride_t, const size_t *rng_state,
+    const bool swizzle_scales = false) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
@@ -616,35 +617,87 @@ __global__ void __launch_bounds__(THREADS_NUM) quantize_transpose_nvfp4_tuned_1D
     {
       // Rowwise
       {
-        using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_X>;
-        // number of scales in X dimension of this chunk
-        const int count = min(SCALES_PER_CHUNK_X, chunk_cols / SCALE_DIM);
+        if (swizzle_scales) {
+          // TK swizzle: write scales in 128×4 tile format.
+          // dst = (row_in_tile % 32) * 16 + (row_in_tile / 32) * 4 + k
+          const int num_tiles_k = static_cast<int>(scale_stride) / 4;
+          for (size_t row = threadIdx.x; row < TunableConfig::CHUNK_DIM_Y; row += THREADS_NUM) {
+            const size_t row_global = scales_block_offset_Y_rowwise + row;
+            if (row_global < rows) {
+              const int tile_m = row_global / 128;
+              const int row_in_tile = row_global % 128;
+              const int j = row_in_tile % 32;
+              const int group = row_in_tile / 32;
+              const int count = min(SCALES_PER_CHUNK_X, chunk_cols / SCALE_DIM);
+              for (int k = 0; k < count; ++k) {
+                const int k_global = scales_block_offset_X_rowwise + k;
+                const int tile_k = k_global / 4;
+                const int k_byte = k_global % 4;
+                const int tile_start = (tile_m * num_tiles_k + tile_k) * 512;
+                const int byte_in_tile = j * 16 + group * 4 + k_byte;
+                reinterpret_cast<uint8_t*>(scales_ptr)[tile_start + byte_in_tile] =
+                    reinterpret_cast<const uint8_t&>(sSFrowwise[row][k]);
+              }
+            }
+          }
+        } else {
+          using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_X>;
+          // number of scales in X dimension of this chunk
+          const int count = min(SCALES_PER_CHUNK_X, chunk_cols / SCALE_DIM);
 
-        for (size_t row = threadIdx.x; row < TunableConfig::CHUNK_DIM_Y; row += THREADS_NUM) {
-          const size_t row_global = scales_block_offset_Y_rowwise + row;
-          if (row_global < rows) {
-            ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(sSFrowwise[row]);
-            const size_t scale_idx_global =
-                row_global * scale_stride + scales_block_offset_X_rowwise;
-            scales_vec.store_to_elts(&scales_ptr[scale_idx_global], 0, count);
+          for (size_t row = threadIdx.x; row < TunableConfig::CHUNK_DIM_Y; row += THREADS_NUM) {
+            const size_t row_global = scales_block_offset_Y_rowwise + row;
+            if (row_global < rows) {
+              ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(sSFrowwise[row]);
+              const size_t scale_idx_global =
+                  row_global * scale_stride + scales_block_offset_X_rowwise;
+              scales_vec.store_to_elts(&scales_ptr[scale_idx_global], 0, count);
+            }
           }
         }
       }
 
-      // Colwise
+      // Colwise — transposed matrix has shape (cols, rows), so
+      // scales have shape (cols_pad, rows/16_pad) in flat layout.
       if constexpr (RETURN_TRANSPOSE) {
-        using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
-        // number of scales in Y dimension of this chunk
-        const int count = min(SCALES_PER_CHUNK_Y, chunk_rows / SCALE_DIM);
+        if (swizzle_scales) {
+          // TK swizzle for colwise: same 128×4 tile pattern as rowwise,
+          // but applied to the transposed scale tensor.
+          const int num_tiles_k_t = static_cast<int>(scale_stride_t) / 4;
+          const int count = min(SCALES_PER_CHUNK_Y, chunk_rows / SCALE_DIM);
+          for (size_t row_tr = threadIdx.x; row_tr < TunableConfig::CHUNK_DIM_X;
+               row_tr += THREADS_NUM) {
+            const size_t row_tr_global = scales_block_offset_Y_tr + row_tr;
+            if (row_tr_global < cols) {
+              const int tile_m = row_tr_global / 128;
+              const int row_in_tile = row_tr_global % 128;
+              const int j = row_in_tile % 32;
+              const int group = row_in_tile / 32;
+              for (int k = 0; k < count; ++k) {
+                const int k_global = scales_block_offset_X_tr + k;
+                const int tile_k = k_global / 4;
+                const int k_byte = k_global % 4;
+                const int tile_start = (tile_m * num_tiles_k_t + tile_k) * 512;
+                const int byte_in_tile = j * 16 + group * 4 + k_byte;
+                reinterpret_cast<uint8_t*>(scales_t_ptr)[tile_start + byte_in_tile] =
+                    reinterpret_cast<const uint8_t&>(sSFcolwise[row_tr][k]);
+              }
+            }
+          }
+        } else {
+          using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
+          // number of scales in Y dimension of this chunk
+          const int count = min(SCALES_PER_CHUNK_Y, chunk_rows / SCALE_DIM);
 
-        for (size_t row_tr = threadIdx.x; row_tr < TunableConfig::CHUNK_DIM_X;
-             row_tr += THREADS_NUM) {
-          const size_t row_tr_global = scales_block_offset_Y_tr + row_tr;
-          if (row_tr_global < cols) {
-            ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(sSFcolwise[row_tr]);
-            const size_t scale_idx_global =
-                row_tr_global * scale_stride_t + scales_block_offset_X_tr;
-            scales_vec.store_to_elts(&scales_t_ptr[scale_idx_global], 0, count);
+          for (size_t row_tr = threadIdx.x; row_tr < TunableConfig::CHUNK_DIM_X;
+               row_tr += THREADS_NUM) {
+            const size_t row_tr_global = scales_block_offset_Y_tr + row_tr;
+            if (row_tr_global < cols) {
+              ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(sSFcolwise[row_tr]);
+              const size_t scale_idx_global =
+                  row_tr_global * scale_stride_t + scales_block_offset_X_tr;
+              scales_vec.store_to_elts(&scales_t_ptr[scale_idx_global], 0, count);
+            }
           }
         }
       }
@@ -791,7 +844,8 @@ inline void quantize_transpose_tuned_1D(const Tensor &input, const Tensor *noop,
             kernel<<<grid, block_size, dshmem_size, stream>>>(
                 tensor_map_input, tensor_map_output, tensor_map_output_transpose, scales_ptr,
                 scales_transpose_ptr, noop_ptr, amax_rowwise_ptr, amax_colwise_ptr, rows, cols,
-                scale_stride, scale_stride_transpose, rng_state);
+                scale_stride, scale_stride_transpose, rng_state,
+                output->with_gemm_swizzled_scales);
           });););
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);

@@ -1046,10 +1046,10 @@ def _nvfp4_2d_multi_tensor_transpose(nvfp4_tensors: List[NVFP4Tensor]):
 def is_custom(x: Optional[Union[Quantizer, QuantizedTensorStorage]] = None) -> bool:
     """Check if an object is custom.
 
-    Returns False if x is a torch.Tensor.
+    Returns False if x is a torch.Tensor or unrecognized type.
     """
     if x is None or isinstance(x, torch.Tensor):
         return False
     if not isinstance(x, (Quantizer, QuantizedTensorStorage)):
-        raise AssertionError("Object must be a Quantizer or QuantizedTensorStorage instance")
+        return False
     return hasattr(x, "custom") and x.custom

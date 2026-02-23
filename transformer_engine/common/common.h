@@ -39,6 +39,13 @@ static_assert(NVTE_BUILD_NUM_PHILOX_ROUNDS > 0,
 #include "./util/cuda_driver.h"
 #include "./util/logging.h"
 
+// Export symbols needed by custom quantisation separate TU
+#ifdef __GNUC__
+#define NVTE_EXPORT __attribute__((visibility("default")))
+#else
+#define NVTE_EXPORT
+#endif
+
 namespace transformer_engine {
 
 inline std::string to_string(const DType type) {
@@ -1013,9 +1020,10 @@ inline bool is_aligned_tensor_data(const Tensor &t, size_t alignment) {
 size_t typeToSize(const DType type);
 size_t typeToNumBits(const DType type);
 
-void CheckNoopTensor(const Tensor &t, const std::string &name);
-void CheckInputTensor(const Tensor &t, const std::string &name, bool check_scale_inv_shapes = true);
-void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty = false);
+NVTE_EXPORT void CheckNoopTensor(const Tensor &t, const std::string &name);
+NVTE_EXPORT void CheckInputTensor(const Tensor &t, const std::string &name,
+                                  bool check_scale_inv_shapes = true);
+NVTE_EXPORT void CheckOutputTensor(const Tensor &t, const std::string &name, bool allow_empty = false);
 
 /*! \brief Update a tensor's FP8 scale-inverse
  *
@@ -1027,12 +1035,12 @@ void update_tensor_scale_inv(Tensor *t, cudaStream_t stream);
 #define NVTE_API_CALL(api_name) \
   transformer_engine::nvtx::NVTXWrapper _##api_name##_nvtx_wrapper(#api_name);
 
-void checkCuDriverContext(CUstream stream);
+NVTE_EXPORT void checkCuDriverContext(CUstream stream);
 
 CUtensorMapDataType get_CUtensorMapDataType(DType dtype);
 
 // Set up parameters to create TMA descriptor.
-void create_2D_tensor_map(
+NVTE_EXPORT void create_2D_tensor_map(
     CUtensorMap &tensorMap, const SimpleTensor &tensor, const uint64_t globalY,
     const uint64_t globalX, const uint32_t shmemY, const uint32_t shmemX,
     const uint32_t stride_elems, const uint32_t offset_elems, const size_t type_num_bits,
@@ -1043,8 +1051,8 @@ bool is_supported_by_CC_100();
 std::vector<std::vector<Tensor *>> convert_tensor_array(NVTETensor **nvte_tensors,
                                                         size_t outer_size, size_t inner_size);
 
-Tensor *convertNVTETensor(const NVTETensor tensor);
-Tensor *convertNVTETensorCheck(const NVTETensor tensor);
+NVTE_EXPORT Tensor *convertNVTETensor(const NVTETensor tensor);
+NVTE_EXPORT Tensor *convertNVTETensorCheck(const NVTETensor tensor);
 
 GroupedTensor *convertNVTEGroupedTensor(const NVTEGroupedTensor tensor);
 GroupedTensor *convertNVTEGroupedTensorCheck(const NVTEGroupedTensor tensor);

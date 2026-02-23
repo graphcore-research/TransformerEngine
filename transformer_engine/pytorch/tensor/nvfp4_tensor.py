@@ -157,6 +157,7 @@ class NVFP4Quantizer(Quantizer):
             with_random_sign_mask, torch.cuda.current_device()
         )
         self.rht_matrix = get_rht_matrix(with_random_sign_mask, torch.cuda.current_device())
+        self.optimize_for_gemm = False
 
     def __getstate__(self):
         """Exclude unpicklable process group from serialized state."""
