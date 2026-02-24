@@ -206,7 +206,8 @@ list(APPEND transformer_engine_cuda_sources
      recipe/current_scaling.cu
      recipe/delayed_scaling.cu
      recipe/fp8_block_scaling.cu
-     comm_gemm_overlap/userbuffers/userbuffers.cu)
+     comm_gemm_overlap/userbuffers/userbuffers.cu
+     util/quantize_rmsnorm.cu)
 
 list(APPEND transformer_engine_cuda_arch_specific_sources
      fused_attn/flash_attn.cu

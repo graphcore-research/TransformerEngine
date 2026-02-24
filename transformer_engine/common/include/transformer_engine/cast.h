@@ -453,6 +453,39 @@ void nvte_group_nvfp4_quantize_with_amax(const NVTETensor input, NVTETensor *out
                                          const NVTEQuantizationConfig quant_config,
                                          cudaStream_t stream);
 
+/*! \brief Fused RMSNorm + SiLU activation + quantize to FP4.
+ *         Applies x_normed = input * inv_rms * norm_weight,
+ *         then SiLU: x_act = x_normed * sigmoid(x_normed),
+ *         then quantizes to output format.
+ *
+ *  \param[in]     input            Input tensor (M, K) bf16.
+ *  \param[in,out] output           Output quantized tensor.
+ *  \param[in]     quant_config     Quantization configuration.
+ *  \param[in]     inv_rms          Pre-computed inverse RMS values (M,).
+ *  \param[in]     norm_weight      RMSNorm weight (K,) bf16.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_quantize_rmsnorm_silu(const NVTETensor input, NVTETensor output,
+                                const NVTEQuantizationConfig quant_config,
+                                const float* inv_rms, const void* norm_weight,
+                                cudaStream_t stream);
+
+/*! \brief Fused RMSNorm (no activation) + quantize to FP4.
+ *         Applies x_normed = input * inv_rms * norm_weight,
+ *         then quantizes to output format.
+ *
+ *  \param[in]     input            Input tensor (M, K) bf16.
+ *  \param[in,out] output           Output quantized tensor.
+ *  \param[in]     quant_config     Quantization configuration.
+ *  \param[in]     inv_rms          Pre-computed inverse RMS values (M,).
+ *  \param[in]     norm_weight      RMSNorm weight (K,) bf16.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_quantize_rmsnorm(const NVTETensor input, NVTETensor output,
+                           const NVTEQuantizationConfig quant_config,
+                           const float* inv_rms, const void* norm_weight,
+                           cudaStream_t stream);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
