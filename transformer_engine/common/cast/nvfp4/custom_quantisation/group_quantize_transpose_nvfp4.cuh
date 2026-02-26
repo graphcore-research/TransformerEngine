@@ -54,6 +54,18 @@ struct MultiAmaxCastTransposeFusionArgs {
   int num_tensors;
   // Whether to write scales in cuBLASLt/TK swizzled layout
   bool swizzle_scales;
+
+  // ── TK-native sg + b_sg_per_tile output (computed inside kernel) ──
+  // sg = amax / 2688.0, one per split. nullptr = disabled.
+  float *sg_output;
+  // Per-tile B_sg for forward GEMM (N/b_tile_size tiles per split)
+  float *fwd_b_sg;
+  // Per-tile B_sg for dgrad GEMM (cols/b_tile_size tiles per split)
+  float *dgrad_b_sg;
+  // Tile size for b_sg expansion (typically 256)
+  int b_tile_size;
+  // Total columns (K dimension, needed for dgrad tile count)
+  int total_cols;
 };
 
 __device__ __forceinline__ int GetTensorId(MultiAmaxCastTransposeFusionArgs *kernel_args_ptr,
@@ -302,6 +314,34 @@ __global__ void __launch_bounds__(THREADS_NUM)
   float S_enc_rowwise = 1.0f;
   float S_dec_rowwise = 1.0f;
   UpdateEncodeDecodeScaleFP32(amax_rowwise_ptr, &S_enc_rowwise, &S_dec_rowwise);
+
+  // ── TK sg + b_sg: first block touching each split writes sg and expands to b_sg tiles ──
+  if (kernel_args.sg_output != nullptr && is_master_thread &&
+      blockIdx.x == 0 && block_offset_Y == split_start) {
+    const float amax_val = (amax_rowwise_ptr != nullptr) ? *amax_rowwise_ptr : 0.0f;
+    const float sg_val = amax_val / 2688.0f;
+    kernel_args.sg_output[tensor_id] = sg_val;
+    // Forward b_sg: N_i / b_tile_size tiles per split, cumulative offset
+    if (kernel_args.fwd_b_sg != nullptr) {
+      int fwd_offset = 0;
+      for (int s = 0; s < tensor_id; ++s) {
+        int split_rows_s = kernel_args.split_sections_range[s + 1] - kernel_args.split_sections_range[s];
+        fwd_offset += split_rows_s / kernel_args.b_tile_size;
+      }
+      int fwd_tiles = (static_cast<int>(split_end - split_start)) / kernel_args.b_tile_size;
+      for (int t = 0; t < fwd_tiles; ++t) {
+        kernel_args.fwd_b_sg[fwd_offset + t] = sg_val;
+      }
+    }
+    // Dgrad b_sg: cols / b_tile_size tiles per split, cumulative offset
+    if (kernel_args.dgrad_b_sg != nullptr) {
+      int dgrad_tiles_per = kernel_args.total_cols / kernel_args.b_tile_size;
+      int dgrad_offset = tensor_id * dgrad_tiles_per;
+      for (int t = 0; t < dgrad_tiles_per; ++t) {
+        kernel_args.dgrad_b_sg[dgrad_offset + t] = sg_val;
+      }
+    }
+  }
 
   // Colwise scaling: use per-split amax pointers from kernel_args
   float S_enc_colwise = 1.0f;
@@ -782,7 +822,11 @@ template <bool use_2d_quantization>
 void group_quantize_transpose(const Tensor &input, const Tensor *noop,
                               std::vector<Tensor *> &output_list, const size_t *split_sections,
                               size_t num_tensors, const QuantizationConfig *quant_config,
-                              cudaStream_t stream) {
+                              cudaStream_t stream,
+                              float *sg_output = nullptr,
+                              float *fwd_b_sg = nullptr,
+                              float *dgrad_b_sg = nullptr,
+                              int b_tile_size = 256) {
 #if FP4_TYPE_SUPPORTED
   using namespace group_quantize_transpose_kernel;
   using namespace ptx;
@@ -870,6 +914,13 @@ void group_quantize_transpose(const Tensor &input, const Tensor *noop,
 
   // Set swizzle flag from first output tensor
   kernel_args.swizzle_scales = output->with_gemm_swizzled_scales;
+
+  // TK sg/b_sg: set from caller args (nullptr = disabled)
+  kernel_args.sg_output = sg_output;
+  kernel_args.fwd_b_sg = fwd_b_sg;
+  kernel_args.dgrad_b_sg = dgrad_b_sg;
+  kernel_args.b_tile_size = b_tile_size;
+  kernel_args.total_cols = static_cast<int>(cols);
 
   const size_t blocks_Y = DIVUP(rows, CHUNK_DIM_Y);
   const size_t blocks_X = DIVUP(cols, CHUNK_DIM_X);
