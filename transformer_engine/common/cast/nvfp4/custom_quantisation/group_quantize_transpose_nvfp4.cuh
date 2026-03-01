@@ -796,15 +796,37 @@ __global__ void __launch_bounds__(THREADS_NUM)
       using ScalesVec = Vec<nvfp4_scale_t, SCALES_PER_CHUNK_Y>;
       const size_t scale_idx_sh = tid_Y_t * SCALES_PER_CHUNK_Y;
       ScalesVec &scales_vec = *reinterpret_cast<ScalesVec *>(&out_colwise_scales_sh[scale_idx_sh]);
-      const size_t scale_idx_global = scales_offset_Y_t * split_colwise_scale_stride + scales_offset_X_t;
+      const size_t split_relative_X_t = scales_offset_X_t - split_start / SCALE_DIM;
       const size_t count =
           (chunk_rows >= CHUNK_DIM_Y) ? SCALES_PER_CHUNK_Y : (chunk_rows / SCALE_DIM);
-      nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
-      constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
-      if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
-        scales_vec.store_to(dst);
+      
+      if (kernel_args.swizzle_scales) {
+        const size_t block_row = scales_offset_Y_t / 128;
+        const size_t block_col = split_relative_X_t / 4;
+        const size_t inner_row = scales_offset_Y_t % 128;
+        const size_t inner_col = split_relative_X_t % 4;
+        
+        const size_t grid_cols = split_colwise_scale_stride / 4;
+        const size_t block_offset = (block_row * grid_cols + block_col) * 512;
+        const size_t inner_offset = inner_col * 128 + inner_row;
+        const size_t scale_idx_global = block_offset + inner_offset;
+        
+        nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
+        constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
+        if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
+          scales_vec.store_to(dst);
+        } else {
+          scales_vec.store_to_elts(dst, 0, count);
+        }
       } else {
-        scales_vec.store_to_elts(dst, 0, count);
+        const size_t scale_idx_global = scales_offset_Y_t * split_colwise_scale_stride + split_relative_X_t;
+        nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
+        constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
+        if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
+          scales_vec.store_to(dst);
+        } else {
+          scales_vec.store_to_elts(dst, 0, count);
+        }
       }
     }
   }

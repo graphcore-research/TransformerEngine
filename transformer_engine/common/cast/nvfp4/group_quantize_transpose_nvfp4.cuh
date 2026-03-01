@@ -763,12 +763,33 @@ __global__ void __launch_bounds__(THREADS_NUM)
       const size_t scale_idx_global = scales_offset_Y_t * split_colwise_scale_stride + split_relative_X_t;
       const size_t count =
           (chunk_rows >= CHUNK_DIM_Y) ? SCALES_PER_CHUNK_Y : (chunk_rows / SCALE_DIM);
-      nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
-      constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
-      if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
-        scales_vec.store_to(dst);
+      
+      if (kernel_args.swizzle_scales) {
+        for (size_t i = 0; i < count; ++i) {
+          const int local_scale_row = scales_offset_Y_t;
+          const int local_scale_col = split_relative_X_t + i;
+          
+          const int tile_m = local_scale_row / 128;
+          const int row_in_tile = local_scale_row % 128;
+          const int tile_k = local_scale_col / 4;
+          const int k_byte = local_scale_col % 4;
+          const int j = row_in_tile % 32;
+          const int grp = row_in_tile / 32;
+          const int num_tiles_k = static_cast<int>(split_colwise_scale_stride) / 4;
+          const int tile_start = (tile_m * num_tiles_k + tile_k) * 512;
+          const int byte_in_tile = j * 16 + grp * 4 + k_byte;
+          
+          reinterpret_cast<uint8_t*>(split_colwise_scale_ptr)[tile_start + byte_in_tile] =
+              reinterpret_cast<const uint8_t&>(scales_vec.data.elt[i]);
+        }
       } else {
-        scales_vec.store_to_elts(dst, 0, count);
+        nvfp4_scale_t *dst = &split_colwise_scale_ptr[scale_idx_global];
+        constexpr size_t vec_bytes = SCALES_PER_CHUNK_Y * sizeof(nvfp4_scale_t);
+        if (count == SCALES_PER_CHUNK_Y && (reinterpret_cast<uintptr_t>(dst) % vec_bytes == 0)) {
+          scales_vec.store_to(dst);
+        } else {
+          scales_vec.store_to_elts(dst, 0, count);
+        }
       }
     }
   }
